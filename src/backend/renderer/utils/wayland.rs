@@ -486,12 +486,13 @@ where
     })
 }
 
-/// Drops cached imports and damage cursors for one renderer context.
+/// Drops renderer surface state and GLES SHM imports for one renderer context.
 ///
 /// All texture-type aliases of the same context are removed. Other contexts,
 /// committed buffers and protocol state remain intact. Existing render elements
 /// retain their own resources until dropped. After clearing all relevant
 /// surfaces, call [`Renderer::invalidate_caches`] before retiring the renderer.
+/// Additional caches owned by renderer adapters are outside this helper.
 pub fn clear_surface_renderer_cache<T: Texture + 'static>(states: &SurfaceData, context: ContextId<T>) {
     let context = context.erased();
     if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
@@ -501,8 +502,6 @@ pub fn clear_surface_renderer_cache<T: Texture + 'static>(states: &SurfaceData, 
     }
     #[cfg(feature = "renderer_gl")]
     crate::backend::renderer::gles::clear_surface_context(states, &context);
-    #[cfg(feature = "renderer_multi")]
-    crate::backend::renderer::multigpu::clear_surface_context(states, &context);
 }
 
 /// Imports buffers of a surface using a given [`Renderer`]
