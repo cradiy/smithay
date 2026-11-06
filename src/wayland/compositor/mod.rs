@@ -588,6 +588,13 @@ pub trait CompositorHandler {
         let _ = parent;
     }
 
+    /// The subsurface role was destroyed and its parent link was removed.
+    ///
+    /// Called after unlinking and resetting subsurface state. The former parent
+    /// can require repainting without a new commit. Already orphaned roles do
+    /// not generate this callback.
+    fn subsurface_destroyed(&mut self, _surface: &WlSurface, _parent: &WlSurface) {}
+
     /// Surface commit handler
     ///
     /// This is called when any changed state from a commit actually becomes visible.

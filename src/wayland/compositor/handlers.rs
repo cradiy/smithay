@@ -629,10 +629,11 @@ where
 
     fn destroyed(
         &self,
-        _state: &mut D,
+        state: &mut D,
         _client_id: wayland_server::backend::ClientId,
         _object: &WlSubsurface,
     ) {
+        let parent = PrivateSurfaceData::get_parent(&self.surface);
         PrivateSurfaceData::unset_parent(&self.surface);
         PrivateSurfaceData::with_states(&self.surface, |state| {
             state
@@ -645,6 +646,9 @@ where
             let mut guard = state.cached_state.get::<SubsurfaceCachedState>();
             guard.for_each_mut(|state| *state = Default::default());
         });
+        if let Some(parent) = parent {
+            state.subsurface_destroyed(&self.surface, &parent);
+        }
     }
 }
 
