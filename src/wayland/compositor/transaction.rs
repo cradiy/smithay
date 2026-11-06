@@ -165,6 +165,10 @@ impl PendingTransaction {
         self.with_inner_state(|state| state.blockers.push(Box::new(blocker) as Box<_>))
     }
 
+    pub(crate) fn has_commits(&self) -> bool {
+        self.with_inner_state(|state| !state.surfaces.is_empty())
+    }
+
     pub(crate) fn is_same_as(&self, other: &PendingTransaction) -> bool {
         let ptr1 = self.with_inner_state(|state| state as *const _);
         let ptr2 = other.with_inner_state(|state| state as *const _);

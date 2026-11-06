@@ -196,17 +196,19 @@ impl PrivateSurfaceData {
             child_guard.parent = None;
         }
         let mut guard = my_data.public_data.cached_state.get::<SurfaceAttributes>();
-        for cached in guard.drain_cached() {
-            if let Some(BufferAssignment::NewBuffer(buffer)) = cached.buffer {
+        let backend = surface.handle().upgrade();
+        guard.for_each_mut(|attributes| {
+            if let Some(BufferAssignment::NewBuffer(buffer)) = attributes.buffer.take() {
                 buffer.release();
             }
-        }
-        if let Some(BufferAssignment::NewBuffer(buffer)) = guard.current().buffer.take() {
-            buffer.release();
-        };
-        if let Some(BufferAssignment::NewBuffer(buffer)) = guard.pending().buffer.take() {
-            buffer.release();
-        };
+            for callback in attributes.frame_callbacks.drain(..) {
+                if let Some(backend) = &backend {
+                    // InvalidId means the callback was already retired, as on disconnect.
+                    let _ = backend.destroy_object::<D>(&callback.id());
+                }
+            }
+        });
+        guard.drain_cached().for_each(drop);
 
         let hooks = my_data.destruction_hooks.clone();
         // don't hold the mutex while the hooks are invoked
@@ -356,25 +358,49 @@ impl PrivateSurfaceData {
             .insert_state(surface.clone(), current_txid);
         my_data.current_txid.0 = my_data.current_txid.0.wrapping_add(1);
         if !is_sync {
-            let client = match surface.client() {
-                Some(client) => client,
-                None => return,
-            };
-            // if we are not sync, add the transaction to the queue
-            let tx = std::mem::take(&mut my_data.pending_transaction);
-            let mut queue_guard = state.client_compositor_state(&client).queue.lock().unwrap();
-            let queue = queue_guard.get_or_insert_with(TransactionQueue::default);
-            queue.append(tx.finalize());
-            // release the mutex, as applying the transaction will try to lock it
-            std::mem::drop(my_data);
-            // trigger the queue
-            let transactions = queue.take_ready();
-            // release the queue lock
-            std::mem::drop(queue_guard);
-            // apply might call commit, which might call blocker_cleared, so we need to free the queue before applying
-            for transaction in transactions {
-                transaction.apply(dh, state)
+            drop(my_data);
+            Self::apply_pending_transaction(surface, dh, state);
+        }
+    }
+
+    fn apply_pending_transaction<C: CompositorHandler + 'static>(
+        surface: &WlSurface,
+        dh: &DisplayHandle,
+        state: &mut C,
+    ) {
+        let Some(client) = surface.client() else {
+            return;
+        };
+        let tx = {
+            let mut data = Self::lock_user_data(surface);
+            // Keep blockers for a future commit when no committed state exists.
+            if !data.pending_transaction.has_commits() {
+                return;
             }
+            std::mem::take(&mut data.pending_transaction)
+        };
+        let mut queue_guard = state.client_compositor_state(&client).queue.lock().unwrap();
+        let queue = queue_guard.get_or_insert_with(TransactionQueue::default);
+        queue.append(tx.finalize());
+        let transactions = queue.take_ready();
+        // Applying may reenter commit or blocker_cleared.
+        drop(queue_guard);
+        for transaction in transactions {
+            transaction.apply(dh, state);
+        }
+    }
+
+    pub fn desynchronize_tree<C: CompositorHandler + 'static>(
+        surface: &WlSurface,
+        dh: &DisplayHandle,
+        state: &mut C,
+    ) {
+        if is_effectively_sync(surface) {
+            return;
+        }
+        Self::apply_pending_transaction(surface, dh, state);
+        for child in Self::get_children(surface) {
+            Self::desynchronize_tree(&child, dh, state);
         }
     }
 

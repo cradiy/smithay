@@ -571,7 +571,7 @@ where
         client: &wayland_server::Client,
         subsurface: &WlSubsurface,
         request: wl_subsurface::Request,
-        _dh: &DisplayHandle,
+        dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
     ) {
         match request {
@@ -609,14 +609,17 @@ where
                     .sync
                     .store(true, Ordering::Release);
             }),
-            wl_subsurface::Request::SetDesync => PrivateSurfaceData::with_states(&self.surface, |state| {
-                state
-                    .data_map
-                    .get::<SubsurfaceState>()
-                    .unwrap()
-                    .sync
-                    .store(false, Ordering::Release);
-            }),
+            wl_subsurface::Request::SetDesync => {
+                PrivateSurfaceData::with_states(&self.surface, |state| {
+                    state
+                        .data_map
+                        .get::<SubsurfaceState>()
+                        .unwrap()
+                        .sync
+                        .store(false, Ordering::Release);
+                });
+                PrivateSurfaceData::desynchronize_tree(&self.surface, dh, state);
+            }
             wl_subsurface::Request::Destroy => {
                 // Our destructor already handles it
             }
