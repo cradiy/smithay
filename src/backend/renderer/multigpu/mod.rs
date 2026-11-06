@@ -1758,6 +1758,16 @@ pub(crate) fn clear_surface_textures(states: &crate::wayland::compositor::Surfac
     }
 }
 
+#[cfg(feature = "wayland_frontend")]
+pub(crate) fn clear_surface_context(
+    states: &crate::wayland::compositor::SurfaceData,
+    context: &ErasedContextId,
+) {
+    if let Some(texture) = states.data_map.get::<Arc<Mutex<MultiTextureInternal>>>() {
+        texture.lock().unwrap().textures.retain(|id, _| id.0 != context.0);
+    }
+}
+
 type DamageAnyTextureMappings = Vec<(Rectangle<i32, BufferCoords>, Box<dyn Any + 'static>)>;
 
 #[derive(Debug)]

@@ -350,6 +350,7 @@ impl RendererSurfaceState {
         self.buffer = None;
         self.textures.clear();
         self.damage.reset();
+        self.renderer_seen.clear();
         self.surface_view = None;
         self.buffer_has_alpha = None;
         self.opaque_regions.clear();
@@ -404,6 +405,8 @@ pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
                     {
                         state.reset();
                     }
+                    #[cfg(feature = "renderer_gl")]
+                    crate::backend::renderer::gles::clear_surface_textures(data);
                     #[cfg(feature = "renderer_multi")]
                     crate::backend::renderer::multigpu::clear_surface_textures(data);
                 });
@@ -481,6 +484,25 @@ where
         let data = states.data_map.get::<RendererSurfaceStateUserData>()?;
         Some(cb(&mut data.lock().unwrap()))
     })
+}
+
+/// Drops cached imports and damage cursors for one renderer context.
+///
+/// All texture-type aliases of the same context are removed. Other contexts,
+/// committed buffers and protocol state remain intact. Existing render elements
+/// retain their own resources until dropped. After clearing all relevant
+/// surfaces, call [`Renderer::invalidate_caches`] before retiring the renderer.
+pub fn clear_surface_renderer_cache<T: Texture + 'static>(states: &SurfaceData, context: ContextId<T>) {
+    let context = context.erased();
+    if let Some(data) = states.data_map.get::<RendererSurfaceStateUserData>() {
+        let mut data = data.lock().unwrap();
+        data.textures.retain(|id, _| id.0 != context.0);
+        data.renderer_seen.retain(|id, _| id.0 != context.0);
+    }
+    #[cfg(feature = "renderer_gl")]
+    crate::backend::renderer::gles::clear_surface_context(states, &context);
+    #[cfg(feature = "renderer_multi")]
+    crate::backend::renderer::multigpu::clear_surface_context(states, &context);
 }
 
 /// Imports buffers of a surface using a given [`Renderer`]

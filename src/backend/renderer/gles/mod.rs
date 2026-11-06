@@ -869,6 +869,26 @@ impl GlesRenderer {
 }
 
 #[cfg(feature = "wayland_frontend")]
+type ShmSurfaceCache = HashMap<ContextId<GlesTexture>, Arc<GlesTextureInternal>>;
+
+#[cfg(feature = "wayland_frontend")]
+pub(crate) fn clear_surface_context(
+    states: &crate::wayland::compositor::SurfaceData,
+    context: &super::ErasedContextId,
+) {
+    if let Some(cache) = states.data_map.get::<Arc<Mutex<ShmSurfaceCache>>>() {
+        cache.lock().unwrap().retain(|id, _| id.0 != context.0);
+    }
+}
+
+#[cfg(feature = "wayland_frontend")]
+pub(crate) fn clear_surface_textures(states: &crate::wayland::compositor::SurfaceData) {
+    if let Some(cache) = states.data_map.get::<Arc<Mutex<ShmSurfaceCache>>>() {
+        cache.lock().unwrap().clear();
+    }
+}
+
+#[cfg(feature = "wayland_frontend")]
 impl ImportMemWl for GlesRenderer {
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
@@ -882,12 +902,10 @@ impl ImportMemWl for GlesRenderer {
 
         // why not store a `GlesTexture`? because the user might do so.
         // this is guaranteed a non-public internal type, so we are good.
-        type CacheMap = HashMap<ContextId<GlesTexture>, Arc<GlesTextureInternal>>;
-
         let mut surface_lock = surface.as_ref().map(|surface_data| {
             surface_data
                 .data_map
-                .get_or_insert_threadsafe(|| Arc::new(Mutex::new(CacheMap::new())))
+                .get_or_insert_threadsafe(|| Arc::new(Mutex::new(ShmSurfaceCache::new())))
                 .lock()
                 .unwrap()
         });
