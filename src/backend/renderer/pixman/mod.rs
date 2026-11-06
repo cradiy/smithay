@@ -594,7 +594,8 @@ impl Frame for PixmanFrame<'_, '_> {
             };
 
             src_image.set_filter(filter, &[])?;
-            src_image.set_repeat(Repeat::None);
+            // Match texture edge clamping when filtering samples outside the image.
+            src_image.set_repeat(Repeat::Pad);
 
             let has_alpha = DrmFourcc::try_from(src_image.format())
                 .ok()
@@ -623,6 +624,7 @@ impl Frame for PixmanFrame<'_, '_> {
                 (width, height),
             );
 
+            src_image.set_repeat(Repeat::None);
             src_image.clear_transform()?;
 
             Result::<(), PixmanError>::Ok(())
