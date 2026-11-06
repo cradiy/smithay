@@ -1,6 +1,6 @@
 use crate::{
     utils::{
-        Serial,
+        Logical, Point, Serial,
         hook::{Hook, HookId},
     },
     wayland::compositor::SUBSURFACE_ROLE,
@@ -8,8 +8,8 @@ use crate::{
 
 use super::{
     BufferAssignment, CompositorHandler, SurfaceAttributes, SurfaceData,
-    cache::MultiCache,
-    handlers::{SurfaceUserData, is_effectively_sync},
+    cache::{Cacheable, MultiCache},
+    handlers::{SubsurfaceCachedState, SurfaceUserData, is_effectively_sync},
     transaction::{Blocker, PendingTransaction, TransactionQueue},
 };
 use std::{
@@ -41,6 +41,7 @@ type DestructionHook = dyn Fn(&mut dyn Any, &WlSurface) + Send + Sync;
 pub(crate) struct PrivateSurfaceData {
     parent: Option<WlSurface>,
     children: Vec<WlSurface>,
+    pending_children: Vec<WlSurface>,
     public_data: SurfaceData,
     pending_transaction: PendingTransaction,
     current_txid: Serial,
@@ -86,6 +87,40 @@ pub enum Location {
     After,
 }
 
+#[derive(Debug, Default)]
+struct SubsurfaceParentCachedState {
+    order: Option<Vec<WlSurface>>,
+    positions: Vec<(WlSurface, Point<i32, Logical>)>,
+}
+
+impl SubsurfaceParentCachedState {
+    fn remove(&mut self, surface: &WlSurface) {
+        if let Some(order) = &mut self.order {
+            order.retain(|child| child != surface);
+        }
+        self.positions.retain(|(child, _)| child != surface);
+    }
+}
+
+impl Cacheable for SubsurfaceParentCachedState {
+    fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+        std::mem::take(self)
+    }
+
+    fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+        if self.order.is_some() {
+            into.order = self.order;
+        }
+        for (child, position) in self.positions {
+            if let Some((_, previous)) = into.positions.iter_mut().find(|(other, _)| other == &child) {
+                *previous = position;
+            } else {
+                into.positions.push((child, position));
+            }
+        }
+    }
+}
+
 /// Possible actions to do after handling a node during tree traversal
 #[derive(Debug)]
 pub enum TraversalAction<T> {
@@ -102,6 +137,7 @@ impl PrivateSurfaceData {
         Mutex::new(PrivateSurfaceData {
             parent: None,
             children: vec![],
+            pending_children: vec![],
             public_data: SurfaceData {
                 role: Default::default(),
                 data_map: Default::default(),
@@ -120,6 +156,7 @@ impl PrivateSurfaceData {
         let mut my_data = Self::lock_user_data(surface);
         debug_assert!(my_data.children.is_empty());
         my_data.children.push(surface.clone());
+        my_data.pending_children.push(surface.clone());
     }
 
     /// Cleans the `as_ref().user_data` of that surface, must be called when it is destroyed
@@ -130,11 +167,23 @@ impl PrivateSurfaceData {
             // We had a parent, lets unregister ourselves from it
             let old_parent_mutex = &old_parent.data::<SurfaceUserData>().unwrap().inner;
             let mut old_parent_guard = old_parent_mutex.lock().unwrap();
-            old_parent_guard.children.retain(|c| c.id() != surface.id());
+            old_parent_guard.remove_child(surface);
         }
 
         let my_data_mutex = &surface_data.inner;
         let mut my_data = my_data_mutex.lock().unwrap();
+        my_data.pending_children.clear();
+        if my_data
+            .public_data
+            .cached_state
+            .has::<SubsurfaceParentCachedState>()
+        {
+            my_data
+                .public_data
+                .cached_state
+                .get::<SubsurfaceParentCachedState>()
+                .for_each_mut(|state| *state = SubsurfaceParentCachedState::default());
+        }
         // orphan all our children
         for child in my_data.children.drain(..) {
             let child_mutex = &child.data::<SurfaceUserData>().unwrap().inner;
@@ -260,27 +309,17 @@ impl PrivateSurfaceData {
         }
     }
 
-    fn commit_sync_surface_tree(
-        surface: &WlSurface,
-        parent_transaction: &PendingTransaction,
-        dh: &DisplayHandle,
-    ) {
+    fn collect_sync_surface_tree(surface: &WlSurface, parent_transaction: &PendingTransaction) {
         let children = PrivateSurfaceData::get_children(surface);
         let mut my_data = Self::lock_user_data(surface);
 
         for child in children {
-            Self::commit_sync_surface_tree(&child, &my_data.pending_transaction, dh);
+            Self::collect_sync_surface_tree(&child, &my_data.pending_transaction);
         }
 
-        let current_txid = my_data.current_txid;
-        my_data.public_data.cached_state.commit(Some(current_txid), dh);
-        my_data
-            .pending_transaction
-            .insert_state(surface.clone(), current_txid);
-
+        // Only states captured by this surface's own commit may be applied.
         let child_tx = std::mem::take(&mut my_data.pending_transaction);
         child_tx.merge_into(parent_transaction);
-        my_data.current_txid.0 = my_data.current_txid.0.wrapping_add(1);
     }
 
     pub fn commit<C: CompositorHandler + 'static>(surface: &WlSurface, dh: &DisplayHandle, state: &mut C) {
@@ -302,10 +341,10 @@ impl PrivateSurfaceData {
                 .map(|s| s.sync.load(Ordering::Acquire))
                 .unwrap_or(false);
 
-            // if we are not sync, but the child is we also have to commit the complete child surface tree
+            // Collect committed descendants without capturing their pending state.
             if !is_sync && is_child_sync {
                 std::mem::drop(child_data);
-                Self::commit_sync_surface_tree(&child, &my_data.pending_transaction, dh);
+                Self::collect_sync_surface_tree(&child, &my_data.pending_transaction);
             } else if is_sync || is_child_sync {
                 let child_tx = std::mem::take(&mut child_data.pending_transaction);
                 child_tx.merge_into(&my_data.pending_transaction);
@@ -385,7 +424,24 @@ impl PrivateSurfaceData {
             child_guard.parent = Some(parent.clone());
         }
         // register child to new parent
-        Self::lock_user_data(parent).children.push(child.clone());
+        let mut parent_data = Self::lock_user_data(parent);
+        parent_data.children.push(child.clone());
+        parent_data.pending_children.push(child.clone());
+        if parent_data
+            .public_data
+            .cached_state
+            .has::<SubsurfaceParentCachedState>()
+        {
+            if let Some(order) = &mut parent_data
+                .public_data
+                .cached_state
+                .get::<SubsurfaceParentCachedState>()
+                .pending()
+                .order
+            {
+                order.push(child.clone());
+            }
+        }
 
         Ok(())
     }
@@ -397,9 +453,7 @@ impl PrivateSurfaceData {
         let old_parent = Self::lock_user_data(child).parent.take();
         // unregister from our parent
         if let Some(old_parent) = old_parent {
-            Self::lock_user_data(&old_parent)
-                .children
-                .retain(|c| c.id() != child.id());
+            Self::lock_user_data(&old_parent).remove_child(child);
         }
     }
 
@@ -418,10 +472,74 @@ impl PrivateSurfaceData {
             .collect()
     }
 
+    fn remove_child(&mut self, child: &WlSurface) {
+        self.children.retain(|other| other != child);
+        self.pending_children.retain(|other| other != child);
+        if self.public_data.cached_state.has::<SubsurfaceParentCachedState>() {
+            self.public_data
+                .cached_state
+                .get::<SubsurfaceParentCachedState>()
+                .for_each_mut(|state| state.remove(child));
+        }
+    }
+
+    pub fn set_subsurface_position(surface: &WlSurface, position: Point<i32, Logical>) {
+        let Some(parent) = Self::get_parent(surface) else {
+            return;
+        };
+        let parent_data = Self::lock_user_data(&parent);
+        let mut cache = parent_data
+            .public_data
+            .cached_state
+            .get::<SubsurfaceParentCachedState>();
+        let pending = cache.pending();
+        if let Some((_, previous)) = pending.positions.iter_mut().find(|(child, _)| child == surface) {
+            *previous = position;
+        } else {
+            pending.positions.push((surface.clone(), position));
+        }
+    }
+
+    pub fn apply_state(surface: &WlSurface, id: Serial, dh: &DisplayHandle) {
+        let mut data = Self::lock_user_data(surface);
+        data.public_data.cached_state.apply_state(id, dh);
+        if !data.public_data.cached_state.has::<SubsurfaceParentCachedState>() {
+            return;
+        }
+        let changes = std::mem::take(
+            data.public_data
+                .cached_state
+                .get::<SubsurfaceParentCachedState>()
+                .current(),
+        );
+        if let Some(mut order) = changes.order {
+            // Children added after this snapshot remain above the older stack.
+            for child in data.children.drain(..) {
+                if !order.contains(&child) {
+                    order.push(child);
+                }
+            }
+            data.children = order;
+        }
+        for (child, position) in changes.positions {
+            let child_data = Self::lock_user_data(&child);
+            // Position belongs to the parent. Child commits must not restore an
+            // older position from their own cached surface state.
+            child_data
+                .public_data
+                .cached_state
+                .get::<SubsurfaceCachedState>()
+                .for_each_mut(|state| state.location = position);
+        }
+    }
+
     /// Reorders a surface relative to one of its sibling
     ///
     /// Fails if `relative_to` is not a sibling or parent of `surface`.
     pub fn reorder(surface: &WlSurface, to: Location, relative_to: &WlSurface) -> Result<(), ()> {
+        if surface == relative_to {
+            return Err(());
+        }
         let parent = Self::get_parent(surface).ok_or(())?;
 
         fn index_of(surface: &WlSurface, slice: &[WlSurface]) -> Option<usize> {
@@ -434,12 +552,12 @@ impl PrivateSurfaceData {
         }
 
         let mut parent_guard = Self::lock_user_data(&parent);
-        let my_index = index_of(surface, &parent_guard.children).unwrap();
-        let mut other_index = match index_of(relative_to, &parent_guard.children) {
+        let my_index = index_of(surface, &parent_guard.pending_children).unwrap();
+        let mut other_index = match index_of(relative_to, &parent_guard.pending_children) {
             Some(idx) => idx,
             None => return Err(()),
         };
-        let me = parent_guard.children.remove(my_index);
+        let me = parent_guard.pending_children.remove(my_index);
         if my_index < other_index {
             other_index -= 1;
         }
@@ -447,7 +565,14 @@ impl PrivateSurfaceData {
             Location::Before => other_index,
             Location::After => other_index + 1,
         };
-        parent_guard.children.insert(new_index, me);
+        parent_guard.pending_children.insert(new_index, me);
+        let order = parent_guard.pending_children.clone();
+        parent_guard
+            .public_data
+            .cached_state
+            .get::<SubsurfaceParentCachedState>()
+            .pending()
+            .order = Some(order);
 
         Ok(())
     }

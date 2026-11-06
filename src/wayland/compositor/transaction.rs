@@ -264,9 +264,7 @@ impl Transaction {
                 continue;
             };
 
-            PrivateSurfaceData::with_states(&surface, |states| {
-                states.cached_state.apply_state(id, dh);
-            });
+            PrivateSurfaceData::apply_state(&surface, id, dh);
 
             PrivateSurfaceData::invoke_post_commit_hooks::<C>(state, dh, &surface);
 

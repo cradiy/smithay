@@ -577,16 +577,13 @@ where
         match request {
             wl_subsurface::Request::SetPosition { x, y } => {
                 let client_scale = state.client_compositor_state(client).client_scale();
-                PrivateSurfaceData::with_states(&self.surface, |state| {
-                    state
-                        .cached_state
-                        .get::<SubsurfaceCachedState>()
-                        .pending()
-                        .location = Point::<i32, Client>::from((x, y))
+                PrivateSurfaceData::set_subsurface_position(
+                    &self.surface,
+                    Point::<i32, Client>::from((x, y))
                         .to_f64()
                         .to_logical(client_scale)
-                        .to_i32_round();
-                })
+                        .to_i32_round(),
+                )
             }
             wl_subsurface::Request::PlaceAbove { sibling } => {
                 if let Err(()) = PrivateSurfaceData::reorder(&self.surface, Location::After, &sibling) {
@@ -643,8 +640,7 @@ where
                 .store(true, Ordering::Release);
 
             let mut guard = state.cached_state.get::<SubsurfaceCachedState>();
-            *guard.pending() = Default::default();
-            *guard.current() = Default::default();
+            guard.for_each_mut(|state| *state = Default::default());
         });
     }
 }

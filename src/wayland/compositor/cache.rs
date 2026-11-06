@@ -81,6 +81,14 @@ impl<T: Default> Default for CachedState<T> {
 }
 
 impl<T> CachedState<T> {
+    pub(crate) fn for_each_mut(&mut self, mut f: impl FnMut(&mut T)) {
+        f(&mut self.pending);
+        f(&mut self.current);
+        for (_, state) in &mut self.cache {
+            f(state);
+        }
+    }
+
     pub(crate) fn drain_cached(&mut self) -> impl Iterator<Item = T> + '_ {
         self.cache.drain(..).map(|(_, state)| state)
     }
