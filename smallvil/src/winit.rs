@@ -62,7 +62,7 @@ pub fn init_winit(
                 let damage = Rectangle::from_size(size);
 
                 {
-                    let (renderer, mut framebuffer) = backend.bind().unwrap();
+                    let (renderer, mut framebuffer, _) = backend.bind().unwrap();
                     smithay::desktop::space::render_output::<
                         _,
                         WaylandSurfaceRenderElement<GlesRenderer>,

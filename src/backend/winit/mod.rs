@@ -18,6 +18,7 @@
 //! The other types in this module are the instances of the associated types of these
 //! two traits for the winit backend.
 
+use std::borrow::Borrow;
 use std::io::Error as IoError;
 use std::mem;
 use std::sync::Arc;
@@ -309,10 +310,15 @@ where
         &mut self.renderer
     }
 
-    /// Bind the underlying window to the underlying renderer.
+    /// Resize and make the window's EGL surface current before querying buffer
+    /// age. Returns the renderer, framebuffer and age of that framebuffer;
+    /// zero means the previous contents are unknown.
     #[instrument(level = "trace", parent = &self.span, skip(self))]
     #[profiling::function]
-    pub fn bind(&mut self) -> Result<(&mut R, R::Framebuffer<'_>), crate::backend::SwapBuffersError> {
+    pub fn bind(&mut self) -> Result<(&mut R, R::Framebuffer<'_>, usize), crate::backend::SwapBuffersError>
+    where
+        R: Borrow<GlesRenderer>,
+    {
         // NOTE: we must resize before making the current context current, otherwise the back
         // buffer will be latched. Some nvidia drivers may not like it, but a lot of wayland
         // software does the order that way due to mesa latching back buffer on each
@@ -323,9 +329,21 @@ where
         }
         self.bind_size = Some(window_size);
 
+        // SAFETY: The backend owns its renderer and window surface on this
+        // thread. Bind alone may only construct a target without making its
+        // EGL surface current, and imports may have switched to another target.
+        unsafe {
+            self.renderer
+                .borrow()
+                .egl_context()
+                .make_current_with_surface(&self.egl_surface)
+                .map_err(GlesError::from)
+                .map_err(<crate::backend::SwapBuffersError as From<GlesError>>::from)?;
+        }
+        let age = self.buffer_age().unwrap_or(0);
         let fb = self.renderer.bind(&mut self.egl_surface)?;
 
-        Ok((&mut self.renderer, fb))
+        Ok((&mut self.renderer, fb, age))
     }
 
     /// Retrieve the underlying `EGLSurface` for advanced operations

@@ -293,11 +293,6 @@ pub fn run_winit() {
             #[cfg(feature = "debug")]
             let mut renderdoc = state.renderdoc.as_mut();
 
-            let age = if *full_redraw > 0 {
-                0
-            } else {
-                backend.buffer_age().unwrap_or(0)
-            };
             #[cfg(feature = "debug")]
             let window_handle = backend
                 .window()
@@ -310,7 +305,8 @@ pub fn run_winit() {
                     }
                 })
                 .unwrap_or_else(|_| std::ptr::null_mut());
-            let render_res = backend.bind().and_then(|(renderer, mut fb)| {
+            let render_res = backend.bind().and_then(|(renderer, mut fb, age)| {
+                let age = if *full_redraw > 0 { 0 } else { age };
                 #[cfg(feature = "debug")]
                 if let Some(renderdoc) = renderdoc.as_mut() {
                     renderdoc.start_frame_capture(renderer.egl_context().get_context_handle(), window_handle);
