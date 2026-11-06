@@ -162,8 +162,6 @@ impl RendererSurfaceState {
                     return;
                 }
                 self.buffer_has_alpha = buffer_has_alpha(&buffer);
-                self.buffer_scale = attrs.buffer_scale;
-                self.buffer_transform = attrs.buffer_transform.into();
 
                 if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
                     self.buffer = Some(Buffer {
@@ -191,6 +189,8 @@ impl RendererSurfaceState {
             return;
         };
 
+        self.buffer_scale = attrs.buffer_scale;
+        self.buffer_transform = attrs.buffer_transform.into();
         let surface_size = buffer_dimensions.to_logical(self.buffer_scale, self.buffer_transform);
         let surface_view = SurfaceView::from_states(states, surface_size, attrs.client_scale);
         let surface_view_changed = self.surface_view.replace(surface_view) != Some(surface_view);
