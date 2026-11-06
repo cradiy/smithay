@@ -27,7 +27,7 @@ pub use wayland_protocols_misc;
 pub use wayland_protocols_wlr;
 #[cfg(feature = "wayland_frontend")]
 pub use wayland_server;
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 pub use winit;
 #[cfg(feature = "x11rb_event_source")]
 pub use x11rb;

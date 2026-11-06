@@ -99,7 +99,7 @@ pub mod udev;
 #[cfg(feature = "backend_vulkan")]
 pub mod vulkan;
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 pub mod winit;
 
 #[cfg(feature = "backend_x11")]

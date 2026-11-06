@@ -1,6 +1,6 @@
 //! Type safe native types for safe context/surface creation
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 use super::wrap_egl_call_ptr;
 use super::{
     EGLDevice, SwapBuffersError,
@@ -10,16 +10,16 @@ use super::{
 #[cfg(feature = "backend_gbm")]
 use crate::utils::DevPath;
 use crate::utils::{Physical, Rectangle};
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 use std::os::raw::c_int;
 use std::os::raw::c_void;
 #[cfg(feature = "backend_gbm")]
 use std::os::unix::io::AsFd;
 use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 use wayland_egl as wegl;
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 use winit::window::Window as WinitWindow;
 
 #[cfg(feature = "backend_gbm")]
@@ -160,7 +160,7 @@ impl<A: AsFd + Send + 'static> EGLNativeDisplay for GbmDevice<A> {
     }
 }
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 impl EGLNativeDisplay for Arc<dyn WinitWindow> {
     fn supported_platforms(&self) -> Vec<EGLPlatform<'_>> {
         use winit::raw_window_handle::{self, HasDisplayHandle};
@@ -362,19 +362,19 @@ pub unsafe trait EGLNativeSurface: Send {
     }
 }
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 static WINIT_SURFACE_ATTRIBUTES: [c_int; 3] = [
     ffi::egl::RENDER_BUFFER as c_int,
     ffi::egl::BACK_BUFFER as c_int,
     ffi::egl::NONE as c_int,
 ];
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 /// Typed Xlib window for the `X11` backend
 #[derive(Debug)]
 pub struct XlibWindow(pub std::os::raw::c_ulong);
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 unsafe impl EGLNativeSurface for XlibWindow {
     unsafe fn create(
         &self,
@@ -397,7 +397,7 @@ unsafe impl EGLNativeSurface for XlibWindow {
     }
 }
 
-#[cfg(feature = "backend_winit")]
+#[cfg(feature = "backend_winit_wayland")]
 unsafe impl EGLNativeSurface for wegl::WlEglSurface {
     unsafe fn create(
         &self,
