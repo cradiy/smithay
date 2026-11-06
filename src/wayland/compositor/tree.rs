@@ -147,6 +147,11 @@ impl PrivateSurfaceData {
             child_guard.parent = None;
         }
         let mut guard = my_data.public_data.cached_state.get::<SurfaceAttributes>();
+        for cached in guard.drain_cached() {
+            if let Some(BufferAssignment::NewBuffer(buffer)) = cached.buffer {
+                buffer.release();
+            }
+        }
         if let Some(BufferAssignment::NewBuffer(buffer)) = guard.current().buffer.take() {
             buffer.release();
         };
