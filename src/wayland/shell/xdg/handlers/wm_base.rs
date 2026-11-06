@@ -58,6 +58,21 @@ where
                 data_init.init(id, XdgPositionerUserData::default());
             }
             xdg_wm_base::Request::GetXdgSurface { id, surface } => {
+                if super::surface::has_live_role(state, &surface)
+                    || crate::wayland::compositor::get_role(&surface).is_some_and(|role| {
+                        role != super::super::XDG_TOPLEVEL_ROLE && role != super::super::XDG_POPUP_ROLE
+                    })
+                {
+                    wm_base.post_error(xdg_wm_base::Error::Role, "wl_surface already has a role");
+                    return;
+                }
+                if super::surface::has_buffer(&surface) {
+                    wm_base.post_error(
+                        xdg_wm_base::Error::InvalidSurfaceState,
+                        "wl_surface already has a buffer",
+                    );
+                    return;
+                }
                 // Do not assign a role to the surface here
                 // xdg_surface is not role, only xdg_toplevel and
                 // xdg_popup are defined as roles

@@ -81,13 +81,27 @@ where
                 }
 
                 if self.has_active_role.load(Ordering::Acquire) {
-                    self.wm_base.post_error(
-                        xdg_wm_base::Error::Role,
+                    xdg_surface.post_error(
+                        xdg_surface::Error::DefunctRoleObject,
                         "xdg_surface was destroyed before its role object",
                     );
                 }
             }
             xdg_surface::Request::GetToplevel { id } => {
+                if self.has_active_role.load(Ordering::Acquire) || has_live_role(state, &self.wl_surface) {
+                    xdg_surface.post_error(
+                        xdg_surface::Error::AlreadyConstructed,
+                        "xdg_surface already has a role object",
+                    );
+                    return;
+                }
+                if has_buffer(&self.wl_surface) {
+                    xdg_surface.post_error(
+                        xdg_surface::Error::UnconfiguredBuffer,
+                        "wl_surface has a buffer before initial configure",
+                    );
+                    return;
+                }
                 // We now can assign a role to the surface
                 let surface = &self.wl_surface;
                 let shell = &self.wm_base;
@@ -155,6 +169,20 @@ where
                 parent,
                 positioner,
             } => {
+                if self.has_active_role.load(Ordering::Acquire) || has_live_role(state, &self.wl_surface) {
+                    xdg_surface.post_error(
+                        xdg_surface::Error::AlreadyConstructed,
+                        "xdg_surface already has a role object",
+                    );
+                    return;
+                }
+                if has_buffer(&self.wl_surface) {
+                    xdg_surface.post_error(
+                        xdg_surface::Error::UnconfiguredBuffer,
+                        "wl_surface has a buffer before initial configure",
+                    );
+                    return;
+                }
                 let positioner_data = *positioner
                     .data::<XdgPositionerUserData>()
                     .unwrap()
@@ -316,8 +344,8 @@ where
                 let configure = match found_configure {
                     Ok(Some(configure)) => configure,
                     Ok(None) => {
-                        self.wm_base.post_error(
-                            xdg_wm_base::Error::InvalidSurfaceState,
+                        xdg_surface.post_error(
+                            xdg_surface::Error::InvalidSerial,
                             format!("wrong configure serial: {}", <u32>::from(serial)),
                         );
                         return;
@@ -363,6 +391,45 @@ impl IsAlive for XdgToplevel {
         let data: &XdgShellSurfaceUserData = self.data().unwrap();
         data.alive_tracker.alive()
     }
+}
+
+pub(super) fn has_live_role<D: super::super::XdgShellHandler>(
+    state: &mut D,
+    surface: &wl_surface::WlSurface,
+) -> bool {
+    let shell = state.xdg_shell_state();
+    shell
+        .known_toplevels
+        .iter()
+        .any(|role| role.wl_surface() == surface && role.alive())
+        || shell
+            .known_popups
+            .iter()
+            .any(|role| role.wl_surface() == surface && role.alive())
+}
+
+pub(super) fn has_buffer(surface: &wl_surface::WlSurface) -> bool {
+    compositor::with_states(surface, |states| {
+        use crate::{
+            backend::renderer::utils::RendererSurfaceStateUserData,
+            wayland::compositor::{BufferAssignment, SurfaceAttributes},
+        };
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        let current = matches!(
+            attributes.current().buffer.as_ref(),
+            Some(BufferAssignment::NewBuffer(_))
+        );
+        let pending = matches!(
+            attributes.pending().buffer.as_ref(),
+            Some(BufferAssignment::NewBuffer(_))
+        );
+        current
+            || pending
+            || states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .is_some_and(|state| state.lock().unwrap().buffer().is_some())
+    })
 }
 
 impl IsAlive for XdgPopup {

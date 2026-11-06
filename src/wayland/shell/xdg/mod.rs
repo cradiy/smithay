@@ -193,11 +193,10 @@ macro_rules! xdg_role {
 
         $(#[$attributes_meta])*
         pub struct $attributes_name {
-                /// Holds the state if the surface has sent the initial
-                /// configure event to the client. It is expected that
-                /// during the first commit a initial
-                /// configure event is sent to the client
-                pub initial_configure_sent: bool,
+                /// First configure serial of the current mapping handshake.
+                /// Earlier in-flight configures may still be acknowledged but
+                /// cannot authorize a buffer for this mapping lifetime.
+                pub initial_configure_serial: Option<Serial>,
                 /// Holds the configures the server has sent out
                 /// to the client waiting to be acknowledged by
                 /// the client. All pending configures that are older
@@ -292,7 +291,7 @@ macro_rules! xdg_role {
             fn default() -> Self {
                 Self {
                     pending_configures: Vec::new(),
-                    initial_configure_sent: false,
+                    initial_configure_serial: None,
                     server_pending: None,
                     last_acked: None,
 
@@ -1442,7 +1441,7 @@ impl ToplevelSurface {
     /// has already been sent to the client or the pending is equal
     /// to the `last_acked`
     fn get_pending_state(&self, attributes: &mut XdgToplevelSurfaceRoleAttributes) -> Option<ToplevelState> {
-        if !attributes.initial_configure_sent {
+        if attributes.initial_configure_serial.is_none() {
             return Some(
                 attributes
                     .server_pending
@@ -1513,12 +1512,13 @@ impl ToplevelSurface {
 
                 // test if we should send a bounds configure event, either because the
                 // bounds changed or we never sent one
-                let bounds_changed = !attributes.initial_configure_sent || (pending.bounds != current.bounds);
+                let bounds_changed =
+                    attributes.initial_configure_serial.is_none() || (pending.bounds != current.bounds);
 
                 // test if we should send a capabilities event, either because the
                 // capabilities changed or we never sent one
-                let capabilities_changed =
-                    !attributes.initial_configure_sent || (pending.capabilities != current.capabilities);
+                let capabilities_changed = attributes.initial_configure_serial.is_none()
+                    || (pending.capabilities != current.capabilities);
 
                 let configure = ToplevelConfigure {
                     serial: SERIAL_COUNTER.next_serial(),
@@ -1526,7 +1526,9 @@ impl ToplevelSurface {
                 };
 
                 attributes.pending_configures.push(configure.clone());
-                attributes.initial_configure_sent = true;
+                attributes
+                    .initial_configure_serial
+                    .get_or_insert(configure.serial);
                 if decoration.is_some() {
                     attributes.initial_decoration_configure_sent = true;
                 }
@@ -1574,7 +1576,8 @@ impl ToplevelSurface {
                 .unwrap()
                 .lock()
                 .unwrap()
-                .initial_configure_sent
+                .initial_configure_serial
+                .is_some()
         })
     }
 
@@ -1588,6 +1591,27 @@ impl ToplevelSurface {
         surface: &wl_surface::WlSurface,
     ) {
         let _span = trace_span!("xdg-toplevel pre-commit", surface = %surface.id()).entered();
+
+        let invalid_size = compositor::with_states(surface, |states| {
+            let mut cache = states.cached_state.get::<SurfaceCachedState>();
+            let pending = cache.pending();
+            (pending.max_size.w > 0 && pending.min_size.w > pending.max_size.w)
+                || (pending.max_size.h > 0 && pending.min_size.h > pending.max_size.h)
+        });
+        if invalid_size {
+            if let Some(toplevel) = state
+                .xdg_shell_state()
+                .known_toplevels
+                .iter()
+                .find(|role| role.wl_surface() == surface)
+            {
+                toplevel.xdg_toplevel().post_error(
+                    xdg_toplevel::Error::InvalidSize,
+                    "minimum size exceeds maximum size",
+                );
+            }
+            return;
+        }
 
         let error = compositor::with_states(surface, |states| {
             let mut role = states
@@ -1615,7 +1639,10 @@ impl ToplevelSurface {
             let got_unmapped = had_buffer_before && !has_buffer;
 
             if has_buffer {
-                let Some(last_acked) = role.last_acked.clone() else {
+                let Some(last_acked) = role.last_acked.clone().filter(|configure| {
+                    role.initial_configure_serial
+                        .is_some_and(|initial| configure.serial >= initial)
+                }) else {
                     return Some((
                         xdg_surface::Error::UnconfiguredBuffer,
                         "must ack the initial configure before attaching buffer",
@@ -1646,6 +1673,9 @@ impl ToplevelSurface {
                 *role = Default::default();
                 role.pending_configures = pending_configures;
                 *guard_toplevel.pending() = Default::default();
+                let mut cache = states.cached_state.get::<SurfaceCachedState>();
+                cache.pending().min_size = (0, 0).into();
+                cache.pending().max_size = (0, 0).into();
 
                 // Don't forget to prepare the default capabilities though.
                 let default_capabilities = &state.xdg_shell_state().default_capabilities;
@@ -1728,7 +1758,7 @@ impl ToplevelSurface {
                 .lock()
                 .unwrap();
 
-            !attributes.initial_configure_sent || attributes.has_pending_changes()
+            attributes.initial_configure_serial.is_none() || attributes.has_pending_changes()
         })
     }
 
@@ -1855,7 +1885,9 @@ impl PopupSurface {
             };
 
             attributes.pending_configures.push(configure);
-            attributes.initial_configure_sent = true;
+            attributes
+                .initial_configure_serial
+                .get_or_insert(configure.serial);
 
             configure
         });
@@ -1903,7 +1935,9 @@ impl PopupSurface {
                 .lock()
                 .unwrap();
 
-            if attributes.initial_configure_sent && self.version() < xdg_popup::EVT_REPOSITIONED_SINCE {
+            if attributes.initial_configure_serial.is_some()
+                && self.version() < xdg_popup::EVT_REPOSITIONED_SINCE
+            {
                 // Return error, initial configure already sent and client
                 // does not support re-configure
                 return Err(PopupConfigureError::AlreadyConfigured);
@@ -1916,7 +1950,7 @@ impl PopupSurface {
                 .as_ref()
                 .is_some_and(|c| c.state.positioner.reactive);
 
-            if attributes.initial_configure_sent && !is_reactive {
+            if attributes.initial_configure_serial.is_some() && !is_reactive {
                 // Return error, the positioner does not allow re-configure
                 return Err(PopupConfigureError::NotReactive);
             }
@@ -1941,7 +1975,8 @@ impl PopupSurface {
                 .unwrap()
                 .lock()
                 .unwrap()
-                .initial_configure_sent
+                .initial_configure_serial
+                .is_some()
         })
     }
 
@@ -2009,7 +2044,10 @@ impl PopupSurface {
             let got_unmapped = had_buffer_before && !has_buffer;
 
             if has_buffer {
-                let Some(last_acked) = role.last_acked else {
+                let Some(last_acked) = role.last_acked.filter(|configure| {
+                    role.initial_configure_serial
+                        .is_some_and(|initial| configure.serial >= initial)
+                }) else {
                     return Err((
                         xdg_surface::Error::UnconfiguredBuffer,
                         "must ack the initial configure before attaching buffer",
@@ -2127,7 +2165,7 @@ impl PopupSurface {
                 .lock()
                 .unwrap();
 
-            !attributes.initial_configure_sent || attributes.has_pending_changes()
+            attributes.initial_configure_serial.is_none() || attributes.has_pending_changes()
         })
     }
 

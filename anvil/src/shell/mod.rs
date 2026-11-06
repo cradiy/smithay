@@ -319,7 +319,8 @@ fn ensure_initial_configure(surface: &WlSurface, space: &Space<WindowElement>, p
                     .unwrap()
                     .lock()
                     .unwrap()
-                    .initial_configure_sent
+                    .initial_configure_serial
+                    .is_some()
             });
             if !initial_configure_sent {
                 toplevel.send_configure();

@@ -160,7 +160,8 @@ pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: 
                 .unwrap()
                 .lock()
                 .unwrap()
-                .initial_configure_sent
+                .initial_configure_serial
+                .is_some()
         });
 
         if !initial_configure_sent {
