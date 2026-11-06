@@ -210,6 +210,26 @@ pub enum Error<E: std::error::Error> {
     /// The provided [`Renderer`] returned an error
     #[error(transparent)]
     Rendering(E),
+    /// Drawing failed after work was queued. Retain input resources until this
+    /// completion point signals; the frame was not successfully rendered.
+    #[error("rendering failed: {error}")]
+    RenderingAborted {
+        /// The original drawing error.
+        #[source]
+        error: E,
+        /// Completion of work queued before drawing failed.
+        sync: SyncPoint,
+    },
+    /// Drawing and explicit finalization both failed. No completion point is
+    /// available; quiesce the backend before releasing input resources.
+    #[error("rendering failed: {render_error}; finishing frame also failed: {finish_error}")]
+    RenderingAndFinishingFailed {
+        /// The original drawing error.
+        render_error: E,
+        /// The error that prevented obtaining a completion point.
+        #[source]
+        finish_error: E,
+    },
     /// The given [`Output`] has no mode set
     #[error(transparent)]
     OutputNoMode(#[from] OutputNoMode),
@@ -240,6 +260,19 @@ impl<E: std::error::Error> std::fmt::Debug for Error<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Rendering(err) => std::fmt::Debug::fmt(err, f),
+            Error::RenderingAborted { error, sync } => f
+                .debug_struct("RenderingAborted")
+                .field("error", error)
+                .field("sync", sync)
+                .finish(),
+            Error::RenderingAndFinishingFailed {
+                render_error,
+                finish_error,
+            } => f
+                .debug_struct("RenderingAndFinishingFailed")
+                .field("render_error", render_error)
+                .field("finish_error", finish_error)
+                .finish(),
             Error::OutputNoMode(err) => std::fmt::Debug::fmt(err, f),
         }
     }
@@ -871,90 +904,109 @@ impl OutputDamageTracker {
             // we have to take the element damage to be able to move it around
             let mut element_damage = std::mem::take(&mut self.element_damage);
             let mut element_opaque_regions = std::mem::take(&mut self.element_opaque_regions);
-            let mut frame = renderer.render(framebuffer, output_size, output_transform)?;
+            let mut frame = renderer
+                .render(framebuffer, output_size, output_transform)
+                .map_err(Error::Rendering)?;
 
-            element_damage.clear();
-            element_damage.extend_from_slice(&self.damage);
-            element_damage =
-                Rectangle::subtract_rects_many_in_place(element_damage, self.opaque_regions.iter().copied());
-
-            trace!("clearing damage {:?}", element_damage);
-            frame.clear(clear_color, &element_damage)?;
-
-            for (z_index, element) in render_elements.iter().rev().enumerate() {
-                let element_id = element.id();
-                let element_geometry = element.geometry(output_scale);
-
+            let draw_result = (|| {
                 element_damage.clear();
-                element_damage.extend(
-                    self.damage
-                        .iter()
-                        .filter_map(|d| d.intersection(element_geometry)),
-                );
-
-                let element_opaque_regions_range =
-                    self.opaque_regions_index.iter().rev().nth(z_index).unwrap();
+                element_damage.extend_from_slice(&self.damage);
                 element_damage = Rectangle::subtract_rects_many_in_place(
-                    element_damage,
-                    self.opaque_regions[..element_opaque_regions_range.start]
-                        .iter()
-                        .copied(),
+                    std::mem::take(&mut element_damage),
+                    self.opaque_regions.iter().copied(),
                 );
-                element_damage.iter_mut().for_each(|d| {
-                    d.loc -= element_geometry.loc;
-                });
 
-                if element_damage.is_empty() {
-                    trace!(
-                        "skipping rendering element {:?} with geometry {:?}, no damage",
-                        element_id, element_geometry
+                trace!("clearing damage {:?}", element_damage);
+                frame.clear(clear_color, &element_damage)?;
+
+                for (z_index, element) in render_elements.iter().rev().enumerate() {
+                    let element_id = element.id();
+                    let element_geometry = element.geometry(output_scale);
+
+                    element_damage.clear();
+                    element_damage.extend(
+                        self.damage
+                            .iter()
+                            .filter_map(|d| d.intersection(element_geometry)),
                     );
-                    continue;
+
+                    let element_opaque_regions_range =
+                        self.opaque_regions_index.iter().rev().nth(z_index).unwrap();
+                    element_damage = Rectangle::subtract_rects_many_in_place(
+                        std::mem::take(&mut element_damage),
+                        self.opaque_regions[..element_opaque_regions_range.start]
+                            .iter()
+                            .copied(),
+                    );
+                    element_damage.iter_mut().for_each(|d| {
+                        d.loc -= element_geometry.loc;
+                    });
+
+                    if element_damage.is_empty() {
+                        trace!(
+                            "skipping rendering element {:?} with geometry {:?}, no damage",
+                            element_id, element_geometry
+                        );
+                        continue;
+                    }
+
+                    element_opaque_regions.clear();
+                    element_opaque_regions.extend(
+                        self.opaque_regions
+                            [element_opaque_regions_range.start..element_opaque_regions_range.end]
+                            .iter()
+                            .copied()
+                            .map(|mut rect| {
+                                rect.loc -= element_geometry.loc;
+                                rect
+                            }),
+                    );
+
+                    trace!(
+                        "rendering element {:?} with geometry {:?} and damage {:?}",
+                        element_id, element_geometry, element_damage,
+                    );
+
+                    let element_src = element.src();
+                    if states
+                        .element_render_state(element_id.clone())
+                        .is_some_and(|state| state.needs_capture)
+                    {
+                        let cache = self
+                            .last_state
+                            .effects_cache
+                            .entry(element_id.clone())
+                            .or_default();
+                        element.capture_framebuffer(&mut frame, element_src, element_geometry, cache)?;
+                    }
+
+                    element.draw(
+                        &mut frame,
+                        element_src,
+                        element_geometry,
+                        &element_damage,
+                        &element_opaque_regions,
+                        self.last_state.effects_cache.get(element_id),
+                    )?;
                 }
 
-                element_opaque_regions.clear();
-                element_opaque_regions.extend(
-                    self.opaque_regions[element_opaque_regions_range.start..element_opaque_regions_range.end]
-                        .iter()
-                        .copied()
-                        .map(|mut rect| {
-                            rect.loc -= element_geometry.loc;
-                            rect
-                        }),
-                );
+                Ok(())
+            })();
 
-                trace!(
-                    "rendering element {:?} with geometry {:?} and damage {:?}",
-                    element_id, element_geometry, element_damage,
-                );
-
-                let element_src = element.src();
-                if states
-                    .element_render_state(element_id.clone())
-                    .is_some_and(|state| state.needs_capture)
-                {
-                    let cache = self
-                        .last_state
-                        .effects_cache
-                        .entry(element_id.clone())
-                        .or_default();
-                    element.capture_framebuffer(&mut frame, element_src, element_geometry, cache)?;
-                }
-
-                element.draw(
-                    &mut frame,
-                    element_src,
-                    element_geometry,
-                    &element_damage,
-                    &element_opaque_regions,
-                    self.last_state.effects_cache.get(element_id),
-                )?;
-            }
-
-            // return the element damage so that we can re-use the allocation
+            // Reuse scratch allocations on failure as well as success.
             std::mem::swap(&mut self.element_damage, &mut element_damage);
             std::mem::swap(&mut self.element_opaque_regions, &mut element_opaque_regions);
-            frame.finish()
+            // Finish explicitly even after a draw error. Dropping an unfinished
+            // GPU frame may wait for completion and cannot return its fence.
+            match (draw_result, frame.finish()) {
+                (Ok(()), Ok(sync)) => Ok(sync),
+                (Err(error), Ok(sync)) => Err(Error::RenderingAborted { error, sync }),
+                (Ok(()), Err(error)) => Err(Error::Rendering(error)),
+                (Err(render_error), Err(finish_error)) => Err(Error::RenderingAndFinishingFailed {
+                    render_error,
+                    finish_error,
+                }),
+            }
         })();
 
         match render_res {
@@ -967,7 +1019,7 @@ impl OutputDamageTracker {
                 // if the rendering errors on us, we need to be prepared, that this whole buffer was partially updated and thus now unusable.
                 // thus clean our old states before returning
                 self.last_state = Default::default();
-                Err(Error::Rendering(err))
+                Err(err)
             }
         }
     }

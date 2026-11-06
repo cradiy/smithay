@@ -2338,6 +2338,12 @@ where
                     }
                 }
                 Err(err) => {
+                    // This path releases its local frame state and swapchain
+                    // buffers. Drain an aborted draw before that ownership ends.
+                    if let OutputDamageTrackerError::RenderingAborted { sync, .. } = &err {
+                        // Fence::wait only returns Interrupted; it must be retried.
+                        while sync.wait().is_err() {}
+                    }
                     // Rendering failed at some point, reset the buffers
                     // as we probably now have some half drawn buffer
                     self.swapchain.reset_buffers();

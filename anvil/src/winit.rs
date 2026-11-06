@@ -360,6 +360,23 @@ pub fn run_winit() {
                 )
                 .map_err(|err| match err {
                     OutputDamageTrackerError::Rendering(err) => err.into(),
+                    OutputDamageTrackerError::RenderingAborted { error, sync } => {
+                        // Preserve this example's synchronous frame cleanup.
+                        // Fence::wait only returns Interrupted; it must be retried.
+                        while sync.wait().is_err() {}
+                        error.into()
+                    }
+                    OutputDamageTrackerError::RenderingAndFinishingFailed {
+                        render_error,
+                        finish_error,
+                    } => {
+                        warn!(
+                            ?render_error,
+                            ?finish_error,
+                            "Rendering and frame finalization failed"
+                        );
+                        finish_error.into()
+                    }
                     _ => unreachable!(),
                 })
             });

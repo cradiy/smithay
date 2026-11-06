@@ -1671,6 +1671,22 @@ fn render_surface<'a>(
             smithay::backend::drm::compositor::RenderFrameError::RenderFrame(
                 OutputDamageTrackerError::Rendering(err),
             ) => SwapBuffersError::from(err),
+            smithay::backend::drm::compositor::RenderFrameError::RenderFrame(
+                OutputDamageTrackerError::RenderingAborted { error, .. },
+            ) => SwapBuffersError::from(error),
+            smithay::backend::drm::compositor::RenderFrameError::RenderFrame(
+                OutputDamageTrackerError::RenderingAndFinishingFailed {
+                    render_error,
+                    finish_error,
+                },
+            ) => {
+                warn!(
+                    ?render_error,
+                    ?finish_error,
+                    "Rendering and frame finalization failed"
+                );
+                SwapBuffersError::from(finish_error)
+            }
             _ => unreachable!(),
         })?;
 
