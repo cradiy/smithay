@@ -189,6 +189,8 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
+mod keyboard;
+use keyboard::KeyboardFocus;
 mod dnd;
 mod mwm;
 pub use self::mwm::*;
@@ -210,6 +212,7 @@ mod atoms {
             // wayland-stuff
             WL_SURFACE_ID,
             WL_SURFACE_SERIAL,
+            _SMITHAY_FOCUS_TIMESTAMP,
 
             // data formats
             UTF8_STRING,
@@ -388,6 +391,11 @@ pub trait XwmHandler {
     fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface);
     /// Window was destroyed
     fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface);
+
+    /// The selected X11 input model has completed its asynchronous focus handoff.
+    fn keyboard_focus_ready(&mut self, xwm: XwmId, window: X11Surface) {
+        let _ = (xwm, window);
+    }
 
     /// Window asks to be positioned or sized differently.
     ///
@@ -612,6 +620,7 @@ pub struct X11Wm {
     // bottom -> top
     client_list_stacking: Vec<X11Window>,
 
+    keyboard_focus: KeyboardFocus,
     is_showing_desktop: bool,
     serial_only: bool,
     net_supported: Vec<x11rb::protocol::xproto::Atom>,
@@ -957,7 +966,7 @@ impl X11Wm {
             0,
             WindowClass::INPUT_OUTPUT,
             x11rb::COPY_FROM_PARENT,
-            &Default::default(),
+            &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
         )?;
         conn.set_selection_owner(win, atoms.WM_S0, x11rb::CURRENT_TIME)?;
         conn.set_selection_owner(win, atoms._NET_WM_CM_S0, x11rb::CURRENT_TIME)?;
@@ -1115,6 +1124,7 @@ impl X11Wm {
             windows: Vec::new(),
             client_list: Vec::new(),
             client_list_stacking: Vec::new(),
+            keyboard_focus: KeyboardFocus::default(),
             is_showing_desktop: false,
             focus_release,
             serial_only,
@@ -1755,7 +1765,9 @@ where
                         if let Some(states) = reply.value32() {
                             let mut state_lock = surface.state.lock().unwrap();
                             for atom in states {
-                                if xwm.net_supported.contains(&atom) {
+                                if atom != xwm.atoms._NET_WM_STATE_FOCUSED
+                                    && xwm.net_supported.contains(&atom)
+                                {
                                     state_lock.net_state.insert(atom);
                                 }
                             }
@@ -1772,6 +1784,15 @@ where
                             state.net_state.remove(&xwm.atoms._NET_WM_STATE_HIDDEN);
                         }
                     }
+
+                    let accepted: Vec<_> = surface.state.lock().unwrap().net_state.iter().copied().collect();
+                    conn.change_property32(
+                        PropMode::REPLACE,
+                        win,
+                        xwm.atoms._NET_WM_STATE,
+                        AtomEnum::ATOM,
+                        &accepted,
+                    )?;
 
                     drop(_guard);
                     state.map_window_request(xwm_id, surface);
@@ -2367,6 +2388,11 @@ where
             }
         }
         Event::PropertyNotify(n) => {
+            if n.window == *xwm.wm_window && n.atom == xwm.atoms._SMITHAY_FOCUS_TIMESTAMP {
+                drop(_guard);
+                xwm.keyboard_timestamp(n.sequence, n.time)?;
+                return Ok(());
+            }
             if n.state == Property::NEW_VALUE && n.atom == xwm.atoms._WL_SELECTION {
                 if let Some(selection) = if xwm.clipboard.incoming.contains_key(&n.window) {
                     Some(&mut xwm.clipboard)
@@ -2469,6 +2495,15 @@ where
                     drop(_guard);
                     state.property_notify(xwm_id, surface, property);
                 }
+            }
+        }
+        Event::FocusIn(n) if !matches!(xwm.keyboard_focus, KeyboardFocus::Unmanaged) => {
+            drop(_guard);
+            if !matches!(n.mode, NotifyMode::GRAB | NotifyMode::UNGRAB)
+                && n.detail != NotifyDetail::POINTER
+                && let Some(window) = xwm.keyboard_entered(n.event)
+            {
+                state.keyboard_focus_ready(xwm_id, window);
             }
         }
         Event::FocusIn(n)
