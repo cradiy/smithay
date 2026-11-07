@@ -68,13 +68,14 @@ struct InnerBuffer {
 impl Drop for InnerBuffer {
     #[inline]
     fn drop(&mut self) {
-        self.buffer.release();
         #[cfg(feature = "backend_drm")]
         if let Some(release_point) = &self.release_point {
             if let Err(err) = release_point.signal() {
                 tracing::error!("Failed to signal syncobj release point: {}", err);
             }
+            return;
         }
+        self.buffer.release();
     }
 }
 
@@ -163,7 +164,15 @@ impl RendererSurfaceState {
                 }
                 self.buffer_has_alpha = buffer_has_alpha(&buffer);
 
-                if !self.buffer.as_ref().is_some_and(|b| b == buffer) {
+                #[cfg(feature = "backend_drm")]
+                let explicit = syncobj_state.acquire_point.is_some()
+                    || self
+                        .buffer
+                        .as_ref()
+                        .is_some_and(|buffer| buffer.inner.release_point.is_some());
+                #[cfg(not(feature = "backend_drm"))]
+                let explicit = false;
+                if explicit || !self.buffer.as_ref().is_some_and(|b| b == buffer) {
                     self.buffer = Some(Buffer {
                         inner: Arc::new(InnerBuffer {
                             buffer,

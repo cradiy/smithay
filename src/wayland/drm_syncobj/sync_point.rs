@@ -11,7 +11,7 @@ use std::{
     },
 };
 
-use crate::backend::drm::{DrmDeviceFd, WeakDrmDeviceFd};
+use crate::backend::drm::DrmDeviceFd;
 use crate::backend::renderer::sync::{Fence, Interrupted};
 use crate::wayland::compositor::{Blocker, BlockerState};
 
@@ -37,14 +37,14 @@ impl DrmTimelineInner {
         Ok(())
     }
 
-    pub(super) fn invalidate(&self) {
-        self.dev_ctx.lock().unwrap().invalidate()
+    pub(super) fn close_device(&self) {
+        self.dev_ctx.lock().unwrap().close_device()
     }
 }
 
 #[derive(Debug)]
 struct DrmTimelineDeviceSpecific {
-    device: WeakDrmDeviceFd,
+    device: Option<DrmDeviceFd>,
     syncobj: drm::control::syncobj::Handle,
     event_fds: Vec<(u64, Weak<OwnedFd>)>,
 }
@@ -53,21 +53,19 @@ impl DrmTimelineDeviceSpecific {
     fn import(fd: BorrowedFd<'_>, device: &DrmDeviceFd) -> io::Result<Self> {
         let syncobj = device.fd_to_syncobj(fd, false)?;
         Ok(DrmTimelineDeviceSpecific {
-            device: device.downgrade(),
+            device: Some(device.clone()),
             syncobj,
             event_fds: Vec::new(),
         })
     }
 
-    fn invalidate(&mut self) {
-        if let Some(device) = self.device.upgrade() {
+    fn close_device(&mut self) {
+        if let Some(device) = self.device.as_ref() {
             let _ = device.destroy_syncobj(self.syncobj);
         }
-        self.device = WeakDrmDeviceFd::new();
-        // trigger event fds
-        for eventfd in self.event_fds.drain(..).filter_map(|(_, x)| Weak::upgrade(&x)) {
-            let _ = rustix::io::write(&eventfd, &[1]);
-        }
+        self.device = None;
+        // The exported timeline fd keeps the kernel object and its eventfd
+        // registrations alive. Closing a device must not fabricate completion.
     }
 }
 
@@ -75,9 +73,9 @@ impl Drop for DrmTimelineDeviceSpecific {
     fn drop(&mut self) {
         // The handle was imported on `device` in `import`; once the timeline
         // (or this device context, replaced in `update_device`) is gone,
-        // nothing refers to it anymore. `invalidate` already destroyed it and
+        // nothing refers to it anymore. `close_device` already destroyed it and
         // reset `device`, in which case this does nothing.
-        if let Some(device) = self.device.upgrade() {
+        if let Some(device) = self.device.as_ref() {
             let _ = device.destroy_syncobj(self.syncobj);
         }
     }
@@ -108,7 +106,7 @@ impl DrmTimeline {
         let ctx = self.0.dev_ctx.lock().unwrap();
         let device = ctx
             .device
-            .upgrade()
+            .as_ref()
             .ok_or::<io::Error>(io::ErrorKind::InvalidInput.into())?;
 
         let mut points = [0];
@@ -144,7 +142,7 @@ impl DrmSyncPoint {
         )?;
         let mut ctx = self.timeline.0.dev_ctx.lock().unwrap();
         ctx.device
-            .upgrade()
+            .as_ref()
             .ok_or::<io::Error>(io::ErrorKind::InvalidInput.into())?
             .syncobj_eventfd(ctx.syncobj, self.point, fd.as_fd(), false)?;
 
@@ -164,7 +162,7 @@ impl DrmSyncPoint {
     pub fn signal(&self) -> io::Result<()> {
         let ctx = self.timeline.0.dev_ctx.lock().unwrap();
         ctx.device
-            .upgrade()
+            .as_ref()
             .ok_or::<io::Error>(io::ErrorKind::InvalidInput.into())?
             .syncobj_timeline_signal(&[ctx.syncobj], &[self.point])
     }
@@ -173,7 +171,7 @@ impl DrmSyncPoint {
     pub fn wait(&self, timeout_nsec: i64) -> io::Result<()> {
         let ctx = self.timeline.0.dev_ctx.lock().unwrap();
         ctx.device
-            .upgrade()
+            .as_ref()
             .ok_or::<io::Error>(io::ErrorKind::InvalidInput.into())?
             .syncobj_timeline_wait(&[ctx.syncobj], &[self.point], timeout_nsec, false, false, false)?;
         Ok(())
@@ -182,7 +180,7 @@ impl DrmSyncPoint {
     /// Export DRM sync file for sync point.
     pub fn export_sync_file(&self) -> io::Result<OwnedFd> {
         let ctx = self.timeline.0.dev_ctx.lock().unwrap();
-        let Some(device) = ctx.device.upgrade() else {
+        let Some(device) = ctx.device.as_ref() else {
             return Err(io::ErrorKind::InvalidInput.into());
         };
 
@@ -221,7 +219,7 @@ impl DrmSyncPoint {
         use std::os::fd::AsRawFd;
 
         let ctx = self.timeline.0.dev_ctx.lock().unwrap();
-        let Some(device) = ctx.device.upgrade() else {
+        let Some(device) = ctx.device.as_ref() else {
             return Err(io::ErrorKind::InvalidInput.into());
         };
 
@@ -353,5 +351,46 @@ impl Blocker for DrmSyncPointBlocker {
         } else {
             BlockerState::Pending
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::DeviceFd;
+    use std::{fs::OpenOptions, path::Path};
+
+    fn open_device(path: &Path) -> DrmDeviceFd {
+        let fd = OpenOptions::new().read(true).write(true).open(path).unwrap();
+        DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(fd)))
+    }
+
+    #[test]
+    #[ignore = "requires SMITHAY_TEST_DRM_RENDER_NODE and a timeline-capable render node"]
+    fn timeline_retains_device_and_close_does_not_signal_acquire() {
+        let path = std::env::var_os("SMITHAY_TEST_DRM_RENDER_NODE").unwrap();
+        let producer = open_device(Path::new(&path));
+        let importer = open_device(Path::new(&path));
+        let handle = producer.create_syncobj(false).unwrap();
+        let fd = producer.syncobj_to_fd(handle, false).unwrap();
+        let timeline = DrmTimeline::new(&importer, fd).unwrap();
+        drop(importer);
+        let point = DrmSyncPoint {
+            timeline: timeline.clone(),
+            point: 9,
+        };
+        let event = point.eventfd().unwrap();
+        timeline.0.close_device();
+        let mut bytes = [0; 8];
+        assert_eq!(
+            rustix::io::read(&event, &mut bytes).unwrap_err(),
+            rustix::io::Errno::AGAIN
+        );
+        producer.syncobj_timeline_signal(&[handle], &[9]).unwrap();
+        assert_eq!(rustix::io::read(&event, &mut bytes).unwrap(), 8);
+        assert_eq!(u64::from_ne_bytes(bytes), 1);
+        timeline.0.update_device(&open_device(Path::new(&path))).unwrap();
+        assert_eq!(timeline.query_signalled_point().unwrap(), 9);
+        producer.destroy_syncobj(handle).unwrap();
     }
 }
