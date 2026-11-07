@@ -163,7 +163,9 @@ impl Source for WlDataSource {
     }
 
     fn cancel(&self) {
-        self.cancelled();
+        if self.version() >= 3 {
+            self.cancelled();
+        }
     }
 
     fn finished(&self) {
