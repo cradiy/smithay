@@ -105,6 +105,10 @@ where
         surface,
         location.into(),
         |_, states, location: &Point<i32, Logical>| {
+            // A parent may hit before children stacked below it are visited.
+            if found.borrow().is_some() {
+                return TraversalAction::Break;
+            }
             let mut location = *location;
             let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
