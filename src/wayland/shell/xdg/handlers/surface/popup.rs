@@ -66,6 +66,14 @@ where
                     .lock()
                     .unwrap();
 
+                if !positioner_data.is_complete() {
+                    self.wm_base.post_error(
+                        wayland_protocols::xdg::shell::server::xdg_wm_base::Error::InvalidPositioner,
+                        "positioner requires a size and anchor rectangle",
+                    );
+                    return;
+                }
+
                 XdgShellHandler::reposition_request(state, handle, positioner_data, token);
             }
             _ => unreachable!(),

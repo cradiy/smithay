@@ -190,6 +190,14 @@ where
                     .lock()
                     .unwrap();
 
+                if !positioner_data.is_complete() {
+                    self.wm_base.post_error(
+                        xdg_wm_base::Error::InvalidPositioner,
+                        "positioner requires a size and anchor rectangle",
+                    );
+                    return;
+                }
+
                 let parent_surface = parent.map(|parent| {
                     let parent_data = parent.data::<XdgSurfaceUserData>().unwrap();
                     parent_data.wl_surface.clone()

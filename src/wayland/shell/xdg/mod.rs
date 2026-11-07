@@ -546,6 +546,13 @@ impl Default for PositionerState {
 }
 
 impl PositionerState {
+    fn is_complete(&self) -> bool {
+        self.rect_size.w > 0
+            && self.rect_size.h > 0
+            && self.anchor_rect.size.w > 0
+            && self.anchor_rect.size.h > 0
+    }
+
     pub(crate) fn anchor_has_edge(&self, edge: xdg_positioner::Anchor) -> bool {
         match edge {
             xdg_positioner::Anchor::Top => {
@@ -579,21 +586,25 @@ impl PositionerState {
     pub fn get_anchor_point(&self) -> Point<i32, Logical> {
         let mut point = self.anchor_rect.loc;
 
-        point.y += if self.anchor_has_edge(xdg_positioner::Anchor::Top) {
-            0
-        } else if self.anchor_has_edge(xdg_positioner::Anchor::Bottom) {
-            self.anchor_rect.size.h
-        } else {
-            self.anchor_rect.size.h / 2
-        };
+        point.y = point
+            .y
+            .saturating_add(if self.anchor_has_edge(xdg_positioner::Anchor::Top) {
+                0
+            } else if self.anchor_has_edge(xdg_positioner::Anchor::Bottom) {
+                self.anchor_rect.size.h
+            } else {
+                self.anchor_rect.size.h / 2
+            });
 
-        point.x += if self.anchor_has_edge(xdg_positioner::Anchor::Left) {
-            0
-        } else if self.anchor_has_edge(xdg_positioner::Anchor::Right) {
-            self.anchor_rect.size.w
-        } else {
-            self.anchor_rect.size.w / 2
-        };
+        point.x = point
+            .x
+            .saturating_add(if self.anchor_has_edge(xdg_positioner::Anchor::Left) {
+                0
+            } else if self.anchor_has_edge(xdg_positioner::Anchor::Right) {
+                self.anchor_rect.size.w
+            } else {
+                self.anchor_rect.size.w / 2
+            });
 
         point
     }
@@ -665,15 +676,15 @@ impl PositionerState {
         // surface will be centered over the anchor point on any axis that had no
         // gravity specified.
         if self.gravity_has_edge(xdg_positioner::Gravity::Top) {
-            geometry.loc.y -= geometry.size.h;
+            geometry.loc.y = geometry.loc.y.saturating_sub(geometry.size.h);
         } else if !self.gravity_has_edge(xdg_positioner::Gravity::Bottom) {
-            geometry.loc.y -= geometry.size.h / 2;
+            geometry.loc.y = geometry.loc.y.saturating_sub(geometry.size.h / 2);
         }
 
         if self.gravity_has_edge(xdg_positioner::Gravity::Left) {
-            geometry.loc.x -= geometry.size.w;
+            geometry.loc.x = geometry.loc.x.saturating_sub(geometry.size.w);
         } else if !self.gravity_has_edge(xdg_positioner::Gravity::Right) {
-            geometry.loc.x -= geometry.size.w / 2;
+            geometry.loc.x = geometry.loc.x.saturating_sub(geometry.size.w / 2);
         }
 
         geometry
