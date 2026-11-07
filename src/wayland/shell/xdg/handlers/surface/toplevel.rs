@@ -125,6 +125,11 @@ where
                     let serial = Serial::from(serial);
 
                     XdgShellHandler::resize_request(state, handle, seat, serial, edges);
+                } else {
+                    toplevel.post_error(
+                        xdg_toplevel::Error::InvalidResizeEdge,
+                        "The resize edge must be a defined edge or corner",
+                    );
                 }
             }
             xdg_toplevel::Request::SetMaxSize { width, height } => {

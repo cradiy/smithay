@@ -322,6 +322,11 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         }
     }
 
+    /// Whether a physical button is still held, including during a compositor grab.
+    pub fn is_button_pressed(&self, button: u32) -> bool {
+        self.arc.inner.lock().unwrap().pressed_buttons.contains(&button)
+    }
+
     /// Origin of the currently focused surface in compositor logical coordinates.
     pub fn current_focus_origin(&self) -> Option<Point<f64, Logical>> {
         self.arc
