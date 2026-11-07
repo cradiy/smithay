@@ -264,9 +264,15 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
         let mut inner = self.arc.inner.lock().unwrap();
         match event.state {
             ButtonState::Pressed => {
+                if inner.pressed_buttons.contains(&event.button) {
+                    return;
+                }
                 inner.pressed_buttons.push(event.button);
             }
             ButtonState::Released => {
+                if !inner.pressed_buttons.contains(&event.button) {
+                    return;
+                }
                 inner.pressed_buttons.retain(|b| *b != event.button);
             }
         }
@@ -289,6 +295,42 @@ impl<D: SeatHandler + 'static> PointerHandle<D> {
             .with_grab(data, &seat, |data, handle, grab| {
                 grab.axis(data, handle, details);
             });
+    }
+
+    /// Cancels the active grab without restoring pending focus and releases held
+    /// buttons directly to the current target. Teardown must not run grab actions.
+    /// The compositor chooses the next focus with a subsequent motion.
+    pub fn release_buttons(&self, data: &mut D, serial: Serial, time: InputTime) {
+        let seat = self.get_seat(data);
+        let mut inner = self.arc.inner.lock().unwrap();
+        inner.unset_grab(data, &seat, serial, time, false);
+        let buttons = std::mem::take(&mut inner.pressed_buttons);
+        if let Some((focus, _)) = &inner.focus {
+            for button in buttons {
+                focus.button(
+                    &seat,
+                    data,
+                    &ButtonEvent {
+                        serial,
+                        time,
+                        button,
+                        state: ButtonState::Released,
+                    },
+                );
+            }
+            focus.frame(&seat, data);
+        }
+    }
+
+    /// Origin of the currently focused surface in compositor logical coordinates.
+    pub fn current_focus_origin(&self) -> Option<Point<f64, Logical>> {
+        self.arc
+            .inner
+            .lock()
+            .unwrap()
+            .focus
+            .as_ref()
+            .map(|(_, origin)| *origin)
     }
 
     /// End of a pointer frame

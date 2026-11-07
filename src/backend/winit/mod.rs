@@ -702,6 +702,12 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                 }
             }
             WindowEvent::PointerLeft {
+                kind: PointerKind::Mouse,
+                ..
+            } => {
+                (self.callback)(WinitEvent::PointerLeft);
+            }
+            WindowEvent::PointerLeft {
                 kind: PointerKind::Touch(finger_id),
                 ..
             } => {
@@ -884,6 +890,9 @@ pub enum WinitEvent {
 
     /// The focus state of the window changed
     Focus(bool),
+
+    /// The mouse pointer left the host window.
+    PointerLeft,
 
     /// An input event occurred.
     Input(InputEvent<WinitInput>),

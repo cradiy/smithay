@@ -580,15 +580,6 @@ where
     D: SeatHandler + 'static,
     <D as SeatHandler>::PointerFocus: WaylandFocus,
 {
-    // Allow client if there is a pointer grab for that client. Like drag and drop.
-    if handle
-        .grab_start_data()
-        .and_then(|data| data.focus)
-        .is_some_and(|focus| focus.0.same_client_as(object_id))
-    {
-        return true;
-    }
-
     if !handle
         .arc
         .wl_pointer
