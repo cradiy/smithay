@@ -9,7 +9,7 @@ use crate::{
     },
     desktop::WindowSurfaceType,
     output::{Output, WeakOutput},
-    utils::{Logical, Point, Rectangle, Time},
+    utils::{IsAlive, Logical, Point, Rectangle, Time},
     wayland::{
         compositor::{SurfaceAttributes, SurfaceData, TraversalAction, with_surface_tree_downward},
         dmabuf::{DmabufFeedback, SurfaceDmabufFeedbackState},
@@ -63,7 +63,10 @@ where
     with_surface_tree_downward(
         surface,
         location,
-        |_, states, loc: &Point<i32, Logical>| {
+        |surface, states, loc: &Point<i32, Logical>| {
+            if !surface.alive() {
+                return TraversalAction::SkipChildren;
+            }
             let mut loc = *loc;
             let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
@@ -104,7 +107,10 @@ where
     with_surface_tree_downward(
         surface,
         location.into(),
-        |_, states, location: &Point<i32, Logical>| {
+        |surface, states, location: &Point<i32, Logical>| {
+            if !surface.alive() {
+                return TraversalAction::SkipChildren;
+            }
             // A parent may hit before children stacked below it are visited.
             if found.borrow().is_some() {
                 return TraversalAction::Break;
@@ -125,6 +131,9 @@ where
             }
         },
         |wl_surface, states, location: &Point<i32, Logical>| {
+            if !wl_surface.alive() {
+                return;
+            }
             let mut location = *location;
             let data = states.data_map.get::<RendererSurfaceStateUserData>();
 
