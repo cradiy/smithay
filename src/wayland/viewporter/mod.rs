@@ -120,7 +120,7 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _resource: &wp_viewporter::WpViewporter,
+        resource: &wp_viewporter::WpViewporter,
         request: <wp_viewporter::WpViewporter as wayland_server::Resource>::Request,
         _dhandle: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
@@ -136,7 +136,7 @@ where
                 });
 
                 if already_has_viewport {
-                    surface.post_error(
+                    resource.post_error(
                         wp_viewporter::Error::ViewportExists,
                         "the surface already has a viewport object associated".to_string(),
                     );
@@ -171,9 +171,9 @@ where
                     inserted
                 });
 
-                // only add the pre-commit hook once for the surface
+                // Validate applied state, including synchronized subsurface transactions.
                 if initial {
-                    compositor::add_pre_commit_hook::<D, _>(&surface, viewport_pre_commit_hook);
+                    compositor::add_post_commit_hook::<D, _>(&surface, viewport_post_commit_hook);
                 }
             }
             wp_viewporter::Request::Destroy => {
@@ -214,6 +214,16 @@ where
                 }
             }
             wp_viewport::Request::SetSource { x, y, width, height } => {
+                // If the wl_surface associated with the wp_viewport is destroyed,
+                // all wp_viewport requests except 'destroy' raise the protocol error no_surface.
+                let Ok(surface) = self.surface.upgrade() else {
+                    resource.post_error(
+                        wp_viewport::Error::NoSurface,
+                        "the wl_surface was destroyed".to_string(),
+                    );
+                    return;
+                };
+
                 // If all of x, y, width and height are -1.0, the source rectangle is unset instead.
                 // Any other set of values where width or height are zero or negative,
                 // or x or y are negative, raise the bad_value protocol error.
@@ -227,16 +237,6 @@ where
                     );
                     return;
                 }
-
-                // If the wl_surface associated with the wp_viewport is destroyed,
-                // all wp_viewport requests except 'destroy' raise the protocol error no_surface.
-                let Ok(surface) = self.surface.upgrade() else {
-                    resource.post_error(
-                        wp_viewport::Error::NoSurface,
-                        "the wl_surface was destroyed".to_string(),
-                    );
-                    return;
-                };
 
                 with_states(&surface, |states| {
                     let mut guard = states.cached_state.get::<ViewportCachedState>();
@@ -252,6 +252,16 @@ where
                 });
             }
             wp_viewport::Request::SetDestination { width, height } => {
+                // If the wl_surface associated with the wp_viewport is destroyed,
+                // all wp_viewport requests except 'destroy' raise the protocol error no_surface.
+                let Ok(surface) = self.surface.upgrade() else {
+                    resource.post_error(
+                        wp_viewport::Error::NoSurface,
+                        "the wl_surface was destroyed".to_string(),
+                    );
+                    return;
+                };
+
                 // If width is -1 and height is -1, the destination size is unset instead.
                 // Any other pair of values for width and height that contains zero or
                 // negative values raises the bad_value protocol error.
@@ -265,16 +275,6 @@ where
                     );
                     return;
                 }
-
-                // If the wl_surface associated with the wp_viewport is destroyed,
-                // all wp_viewport requests except 'destroy' raise the protocol error no_surface.
-                let Ok(surface) = self.surface.upgrade() else {
-                    resource.post_error(
-                        wp_viewport::Error::NoSurface,
-                        "the wl_surface was destroyed".to_string(),
-                    );
-                    return;
-                };
 
                 with_states(&surface, |states| {
                     let mut guard = states.cached_state.get::<ViewportCachedState>();
@@ -306,15 +306,12 @@ pub struct ViewportState {
 
 pub(crate) struct ViewportMarker(Weak<wp_viewport::WpViewport>);
 
-fn viewport_pre_commit_hook<D: 'static>(
+fn viewport_post_commit_hook<D: 'static>(
     _state: &mut D,
     _dh: &DisplayHandle,
     surface: &wl_surface::WlSurface,
 ) {
     with_states(surface, |states| {
-        states
-            .data_map
-            .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None));
         let viewport = states
             .data_map
             .get::<ViewporterSurfaceState>()
@@ -323,7 +320,7 @@ fn viewport_pre_commit_hook<D: 'static>(
             .unwrap();
         if let Some(viewport) = &*viewport {
             let mut guard = states.cached_state.get::<ViewportCachedState>();
-            let viewport_state = guard.pending();
+            let viewport_state = guard.current();
 
             // If src_width or src_height are not integers and destination size is not set,
             // the bad_size protocol error is raised when the surface state is applied.
@@ -347,15 +344,10 @@ fn viewport_pre_commit_hook<D: 'static>(
 /// If the viewport violates any protocol checks a protocol error will be raised and `false`
 /// is returned.
 pub fn ensure_viewport_valid(states: &SurfaceData, buffer_size: Size<i32, Logical>) -> bool {
-    states
-        .data_map
-        .insert_if_missing_threadsafe::<ViewporterSurfaceState, _>(|| Mutex::new(None));
-    let viewport = states
-        .data_map
-        .get::<ViewporterSurfaceState>()
-        .unwrap()
-        .lock()
-        .unwrap();
+    let Some(viewport) = states.data_map.get::<ViewporterSurfaceState>() else {
+        return true;
+    };
+    let viewport = viewport.lock().unwrap();
 
     if let Some(viewport) = &*viewport {
         let mut guard = states.cached_state.get::<ViewportCachedState>();

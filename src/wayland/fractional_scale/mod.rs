@@ -130,7 +130,7 @@ where
         &self,
         state: &mut D,
         _client: &wayland_server::Client,
-        _resource: &wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        resource: &wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         request: <wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1 as Resource>::Request,
         _dhandle: &DisplayHandle,
         data_init: &mut wayland_server::DataInit<'_, D>,
@@ -149,7 +149,7 @@ where
                 });
 
                 if already_has_fractional_scale {
-                    surface.post_error(
+                    resource.post_error(
                         wp_fractional_scale_manager_v1::Error::FractionalScaleExists,
                         "the surface already has a fractional_scale object associated".to_string(),
                     );
