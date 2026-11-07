@@ -142,6 +142,11 @@ impl PointerAxisEvent<WinitInput> for WinitMouseWheelEvent {
         match self.source {
             ScrollSource::Wheel => AxisSource::Wheel,
             ScrollSource::Finger => AxisSource::Finger,
+            // Discrete line deltas identify wheel input even when the host
+            // does not supply a source for this scroll frame.
+            ScrollSource::Unknown if matches!(self.delta, MouseScrollDelta::LineDelta(..)) => {
+                AxisSource::Wheel
+            }
             ScrollSource::Momentum | ScrollSource::Unknown => AxisSource::Continuous,
             _ => AxisSource::Continuous,
         }
