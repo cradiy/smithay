@@ -16,6 +16,8 @@ use wayland_server::{
 };
 
 mod dispatch;
+#[cfg(test)]
+mod tests;
 pub use dispatch::KeyboardShortcutsInhibitorUserData;
 
 use crate::{
@@ -23,40 +25,31 @@ use crate::{
     wayland::GlobalData,
 };
 
-type SeatId = ObjectId;
-
-/// List of inhibitors associated with WlSeat
+/// Inhibitors indexed by surface for one logical seat.
 #[derive(Debug, Default)]
-struct SeatInhibitors(Vec<KeyboardShortcutsInhibitor>);
+struct SeatInhibitors(HashMap<ObjectId, KeyboardShortcutsInhibitor>);
 
 impl SeatInhibitors {
     fn push(&mut self, value: KeyboardShortcutsInhibitor) {
-        self.0.push(value)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.insert(value.wl_surface().id(), value);
     }
 
     /// Check if any inhibitor is active
     fn is_inhibited(&self) -> bool {
-        self.0.iter().any(|i| i.is_active())
+        self.0.values().any(|i| i.is_active())
     }
 
-    fn remove(&mut self, id: ObjectId) -> Option<KeyboardShortcutsInhibitor> {
-        self.0
-            .iter()
-            .position(|i| i.inhibitor.id() == id)
-            .map(|id| self.0.remove(id))
+    fn remove(&mut self, surface: &ObjectId) -> Option<KeyboardShortcutsInhibitor> {
+        self.0.remove(surface)
     }
 
     fn surface_has_inhibitor(&self, surface: &WlSurface) -> bool {
-        self.inhibitor_for_surface(surface).is_some()
+        self.0.contains_key(&surface.id())
     }
 
     /// Find inhibitor_for WlSurface
     fn inhibitor_for_surface(&self, surface: &WlSurface) -> Option<&KeyboardShortcutsInhibitor> {
-        self.0.iter().find(|i| i.wl_surface() == surface)
+        self.0.get(&surface.id())
     }
 }
 
@@ -64,7 +57,8 @@ impl SeatInhibitors {
 #[derive(Debug)]
 pub struct KeyboardShortcutsInhibitState {
     manager_global: GlobalId,
-    inhibitors: HashMap<SeatId, Rc<RefCell<SeatInhibitors>>>,
+    // Resource data is Send + Sync; keep the owner-thread seat lookup here.
+    inhibitors: HashMap<ObjectId, std::rc::Weak<RefCell<SeatInhibitors>>>,
 }
 
 impl KeyboardShortcutsInhibitState {
@@ -106,7 +100,7 @@ impl KeyboardShortcutsInhibitor {
     }
 
     /// Seat that is being inhibited
-    fn seat_id(&self) -> &SeatId {
+    fn seat_id(&self) -> &ObjectId {
         &self.data().seat
     }
 

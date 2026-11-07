@@ -1,5 +1,5 @@
 use std::{
-    collections::hash_map::Entry,
+    rc::Rc,
     sync::atomic::{self, AtomicBool},
 };
 
@@ -67,22 +67,20 @@ where
             zwp_keyboard_shortcuts_inhibit_manager_v1::Request::InhibitShortcuts { id, surface, seat } => {
                 let seat_id = seat.id();
 
-                if handler
-                    .keyboard_shortcuts_inhibit_state()
-                    .inhibitors
-                    .get(&seat_id)
-                    .map(|list| list.borrow().surface_has_inhibitor(&surface))
-                    .unwrap_or(false)
+                // Multiple wl_seat bindings refer to the same logical seat.
+                // A removed seat leaves its existing resources inert.
+                let inhibitors = Seat::<D>::from_resource(&seat)
+                    .map(|seat| super::SeatData::get(&seat).borrow().inhibitors.clone());
+                if inhibitors
+                    .as_ref()
+                    .is_some_and(|list| list.borrow().surface_has_inhibitor(&surface))
                 {
                     resource.post_error(
                         zwp_keyboard_shortcuts_inhibit_manager_v1::Error::AlreadyInhibited,
-                        "Keyboare shortcuts for this surface are already inhibited",
+                        "Keyboard shortcuts for this surface are already inhibited",
                     );
                     return;
                 }
-
-                let seat = Seat::<D>::from_resource(&seat).unwrap();
-                let seat_data = super::SeatData::get(&seat);
 
                 let inhibitor = data_init.init(
                     id,
@@ -95,15 +93,14 @@ where
 
                 let inhibitor = super::KeyboardShortcutsInhibitor { inhibitor };
 
-                let list = handler
-                    .keyboard_shortcuts_inhibit_state()
-                    .inhibitors
-                    .entry(seat_id)
-                    .or_insert_with(|| seat_data.borrow().inhibitors.clone());
-
-                list.borrow_mut().push(inhibitor.clone());
-
-                handler.new_inhibitor(inhibitor);
+                if let Some(list) = inhibitors {
+                    list.borrow_mut().push(inhibitor.clone());
+                    handler
+                        .keyboard_shortcuts_inhibit_state()
+                        .inhibitors
+                        .insert(inhibitor.inhibitor.id(), Rc::downgrade(&list));
+                    handler.new_inhibitor(inhibitor);
+                }
             }
             zwp_keyboard_shortcuts_inhibit_manager_v1::Request::Destroy => {}
             _ => unreachable!(),
@@ -133,15 +130,13 @@ where
     fn destroyed(&self, handler: &mut D, _client: ClientId, wl_inhibitor: &ZwpKeyboardShortcutsInhibitorV1) {
         self.is_active.store(false, atomic::Ordering::Release);
 
-        let state = handler.keyboard_shortcuts_inhibit_state();
-
-        if let Entry::Occupied(mut entry) = state.inhibitors.entry(self.seat.clone()) {
-            let inhibitor = entry.get_mut().borrow_mut().remove(wl_inhibitor.id());
-
-            if entry.get().borrow().is_empty() {
-                entry.remove();
-            }
-
+        if let Some(list) = handler
+            .keyboard_shortcuts_inhibit_state()
+            .inhibitors
+            .remove(&wl_inhibitor.id())
+            .and_then(|list| list.upgrade())
+        {
+            let inhibitor = list.borrow_mut().remove(&self.surface.id());
             if let Some(inhibitor) = inhibitor {
                 handler.inhibitor_destroyed(inhibitor)
             }
