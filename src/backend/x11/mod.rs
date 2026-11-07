@@ -114,7 +114,7 @@ use x11rb::{
         self as x11, ErrorKind,
         dri3::ConnectionExt as _,
         xinput,
-        xproto::{ColormapAlloc, ConnectionExt, CreateWindowAux, VisualClass, WindowClass, WindowWrapper},
+        xproto::{ColormapAlloc, ConnectionExt, VisualClass},
     },
     rust_connection::{ReplyError, RustConnection},
 };
@@ -235,26 +235,7 @@ impl X11Backend {
 
         let atoms = Atoms::new(&*connection)?.reply()?;
 
-        // We need to give the X11Source a window we have created, we cannot send the close event to the root
-        // window (0). To handle this, we will create a window we never map or provide to users to the backend
-        // can be sent a message for shutdown.
-
-        let close_window = WindowWrapper::create_window(
-            &*connection,
-            x11rb::COPY_DEPTH_FROM_PARENT,
-            screen.root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            x11rb::COPY_FROM_PARENT,
-            &CreateWindowAux::new(),
-        )?
-        .into_window();
-
-        let source = X11Source::new(connection.clone(), close_window, atoms._SMITHAY_X11_BACKEND_CLOSE);
+        let source = X11Source::new(connection.clone());
 
         let inner = X11Inner {
             connection: connection.clone(),
@@ -613,7 +594,6 @@ atom_manager! {
         WM_DELETE_WINDOW,
         _NET_WM_NAME,
         UTF8_STRING,
-        _SMITHAY_X11_BACKEND_CLOSE,
     }
 }
 

@@ -9,18 +9,11 @@ use std::{
 };
 
 use tracing::{error, warn};
-use x11rb::{
-    connection::Connection as _,
-    protocol::{
-        Event,
-        xproto::{Atom, CLIENT_MESSAGE_EVENT, ClientMessageEvent, ConnectionExt as _, EventMask, Window},
-    },
-    rust_connection::RustConnection,
-};
+use x11rb::{connection::Connection as _, protocol::Event, rust_connection::RustConnection};
 
 use calloop::{
     EventSource, Poll, PostAction, Readiness, Token, TokenFactory,
-    channel::{Channel, ChannelError, Event as ChannelEvent, Sender, channel},
+    channel::{Channel, ChannelError, Event as ChannelEvent, SyncSender, sync_channel},
 };
 
 /// Integration of an x11rb X11 connection with calloop.
@@ -38,19 +31,13 @@ pub struct X11Source {
     connection: Arc<RustConnection>,
     channel: Option<Channel<Event>>,
     event_thread: Option<JoinHandle<()>>,
-    close_window: Window,
-    close_type: Atom,
 }
 
 impl X11Source {
-    /// Create a new X11 source.
-    ///
-    /// The returned instance will use `SendRequest` to cause a `ClientMessageEvent` to be sent to
-    /// the given window with the given type. The expectation is that this is a window that was
-    /// created by us. Thus, the event reading thread will wake up and check an internal exit flag,
-    /// then exit.
-    pub fn new(connection: Arc<RustConnection>, close_window: Window, close_type: Atom) -> Self {
-        let (sender, channel) = channel();
+    /// Creates a bounded event reader. Dropping the source closes its transport
+    /// and wakes the reader without waiting for the X server to respond.
+    pub fn new(connection: Arc<RustConnection>) -> Self {
+        let (sender, channel) = sync_channel(256);
         let conn = Arc::clone(&connection);
         let event_thread = Some(spawn(move || {
             run_event_thread(conn, sender);
@@ -60,8 +47,6 @@ impl X11Source {
             connection,
             channel: Some(channel),
             event_thread,
-            close_window,
-            close_type,
         }
     }
 }
@@ -71,23 +56,10 @@ impl Drop for X11Source {
         // Signal the worker thread to exit by dropping the read end of the channel.
         self.channel.take();
 
-        // Send an event to wake up the worker so that it actually exits
-        let event = ClientMessageEvent {
-            response_type: CLIENT_MESSAGE_EVENT,
-            format: 8,
-            sequence: 0,
-            window: self.close_window,
-            type_: self.close_type,
-            data: [0; 20].into(),
-        };
-
-        let _ = self
-            .connection
-            .send_event(false, self.close_window, EventMask::NO_EVENT, event);
-        let _ = self.connection.flush();
-
-        // Wait for the worker thread to exit
-        self.event_thread.take().map(|handle| handle.join());
+        // Interrupt a blocked reader even if the X server has stopped. Dropping
+        // the join handle detaches it; teardown never waits on the compositor.
+        let _ = rustix::net::shutdown(self.connection.stream(), rustix::net::Shutdown::Both);
+        self.event_thread.take();
     }
 }
 
@@ -154,7 +126,7 @@ impl EventSource for X11Source {
 /// This thread will call wait_for_event(). RustConnection then ensures internally to wake us up
 /// when an event arrives. So far, this seems to be the only safe way to integrate x11rb with
 /// calloop.
-fn run_event_thread(connection: Arc<RustConnection>, sender: Sender<Event>) {
+fn run_event_thread(connection: Arc<RustConnection>, sender: SyncSender<Event>) {
     loop {
         let event = match connection.wait_for_event() {
             Ok(event) => event,

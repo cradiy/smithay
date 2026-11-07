@@ -211,9 +211,6 @@ mod atoms {
             WL_SURFACE_ID,
             WL_SURFACE_SERIAL,
 
-            // private
-            _SMITHAY_CLOSE_CONNECTION,
-
             // data formats
             UTF8_STRING,
             TEXT,
@@ -616,6 +613,9 @@ pub struct X11Wm {
     client_list_stacking: Vec<X11Window>,
 
     is_showing_desktop: bool,
+    serial_only: bool,
+    net_supported: Vec<x11rb::protocol::xproto::Atom>,
+    client_id: wayland_server::backend::ClientId,
 
     pub(super) focus_release: FocusReleaseHandle,
 
@@ -666,7 +666,9 @@ impl FocusReleaseHandle {
         if !self.pending.swap(false, Ordering::AcqRel) {
             return;
         }
-        let Some(conn) = self.conn.upgrade() else { return };
+        let Some(conn) = self.conn.upgrade() else {
+            return;
+        };
         if let Err(err) = conn.set_input_focus(InputFocus::NONE, x11rb::NONE, x11rb::CURRENT_TIME) {
             warn!("Unable to release X11 keyboard focus: {}", err);
         }
@@ -793,6 +795,52 @@ impl Drop for OwnedX11Window {
     }
 }
 
+/// A completed XWM handshake awaiting event-loop registration.
+#[derive(Debug)]
+pub struct PreparedX11Wm {
+    wm: X11Wm,
+    source: X11Source,
+    focus_source: ping::PingSource,
+    client: wayland_server::Client,
+}
+impl PreparedX11Wm {
+    /// Installs already prepared sources; performs no X11 round trips.
+    pub fn register<D>(
+        self,
+        handle: LoopHandle<'static, D>,
+        dh: &DisplayHandle,
+    ) -> Result<X11Wm, Box<dyn std::error::Error>>
+    where
+        D: XwmHandler + xwayland_shell::XWaylandShellHandler + SeatHandler + DndGrabHandler + 'static,
+        <D as SeatHandler>::PointerFocus: DndFocus<D>,
+        <D as SeatHandler>::TouchFocus: DndFocus<D>,
+    {
+        let id = self.wm.id;
+        self.client
+            .get_data::<XWaylandClientData>()
+            .unwrap()
+            .user_data()
+            .insert_if_missing_threadsafe(|| id);
+        let release = self.wm.focus_release.clone();
+        handle.insert_source(self.focus_source, move |_, _, _| release.dispatch())?;
+        let event_handle = handle.downgrade();
+        let dh = dh.clone();
+        handle.insert_source(self.source, move |event, _, data| match event {
+            calloop::channel::Event::Msg(event) => {
+                if let Some(event_handle) = event_handle.upgrade() {
+                    if let Err(err) = handle_event(&event_handle, &dh, data, id, event) {
+                        warn!(id = id.0, err = ?err, "Failed to handle X11 event");
+                    }
+                }
+            }
+            calloop::channel::Event::Closed => {
+                data.disconnected(id);
+            }
+        })?;
+        Ok(self.wm)
+    }
+}
+
 impl X11Wm {
     /// Start a new window manager for a given Xwayland connection
     ///
@@ -816,6 +864,22 @@ impl X11Wm {
         <D as SeatHandler>::TouchFocus: DndFocus<D>,
         D: 'static,
     {
+        Self::prepare_wm(connection, client, "Smithay X WM", None, false)
+            .map_err(|error| error as Box<dyn std::error::Error>)?
+            .register(handle, dh)
+    }
+
+    /// Performs the X server handshake without a compositor loop handle. This
+    /// may run on a worker while the compositor continues dispatching Wayland.
+    /// `supported` replaces the default EWMH capability list; `serial_only`
+    /// disables resource-ID based surface association.
+    pub fn prepare_wm(
+        connection: UnixStream,
+        client: wayland_server::Client,
+        name: &str,
+        supported: Option<&[&str]>,
+        serial_only: bool,
+    ) -> Result<PreparedX11Wm, Box<dyn std::error::Error + Send + Sync>> {
         let id = XwmId(xwm_id::next());
         let span = debug_span!("xwayland_wm", id = id.0);
         let _guard = span.enter();
@@ -932,6 +996,17 @@ impl X11Wm {
         } else {
             net_supported_base.to_vec()
         };
+        let net_supported = match supported {
+            Some(names) => names
+                .iter()
+                .map(|name| {
+                    conn.intern_atom(false, name.as_bytes())?
+                        .reply()
+                        .map(|reply| reply.atom)
+                })
+                .collect::<Result<Vec<_>, x11rb::errors::ReplyError>>()?,
+            None => net_supported,
+        };
         conn.change_property32(
             PropMode::REPLACE,
             screen.root,
@@ -953,20 +1028,24 @@ impl X11Wm {
             AtomEnum::WINDOW,
             &[],
         )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            screen.root,
-            atoms._NET_ACTIVE_WINDOW,
-            AtomEnum::WINDOW,
-            &[0],
-        )?;
-        conn.change_property32(
-            PropMode::REPLACE,
-            screen.root,
-            atoms._NET_SHOWING_DESKTOP,
-            AtomEnum::CARDINAL,
-            &[0],
-        )?;
+        if net_supported.contains(&atoms._NET_ACTIVE_WINDOW) {
+            conn.change_property32(
+                PropMode::REPLACE,
+                screen.root,
+                atoms._NET_ACTIVE_WINDOW,
+                AtomEnum::WINDOW,
+                &[0],
+            )?;
+        }
+        if net_supported.contains(&atoms._NET_SHOWING_DESKTOP) {
+            conn.change_property32(
+                PropMode::REPLACE,
+                screen.root,
+                atoms._NET_SHOWING_DESKTOP,
+                AtomEnum::CARDINAL,
+                &[0],
+            )?;
+        }
         conn.change_property32(
             PropMode::REPLACE,
             screen.root,
@@ -986,7 +1065,7 @@ impl X11Wm {
             win,
             atoms._NET_WM_NAME,
             atoms.UTF8_STRING,
-            "Smithay X WM".as_bytes(),
+            name.as_bytes(),
         )?;
         debug!(window = win, "Created WM Window");
 
@@ -994,13 +1073,10 @@ impl X11Wm {
         let xsettings = XSettings::new(&conn, screen.root_depth, screen.root, &atoms)?;
         conn.flush()?;
 
-        let source = X11Source::new(Arc::clone(&conn), win, atoms._SMITHAY_CLOSE_CONNECTION);
+        let source = X11Source::new(Arc::clone(&conn));
 
         let client_data = client.get_data::<XWaylandClientData>().unwrap();
         let client_scale = client_data.compositor_state.clone_client_scale();
-
-        // We need this for the commit hook.
-        client_data.user_data().insert_if_missing(|| id);
 
         let _xfixes_data = conn
             .query_extension(x11rb::protocol::xfixes::X11_EXTENSION_NAME.as_bytes())?
@@ -1017,17 +1093,13 @@ impl X11Wm {
         let wm_window = OwnedX11Window::new(win, &conn);
 
         let (focus_release, focus_release_source) = FocusReleaseHandle::new(&conn)?;
-        {
-            let release = focus_release.clone();
-            handle.insert_source(focus_release_source, move |_, _, _| release.dispatch())?;
-        }
-
         drop(_guard);
         let wm = Self {
             id,
             conn,
             client_scale,
             screen,
+            net_supported,
             atoms,
             servertime_counter,
             xsettings,
@@ -1045,24 +1117,17 @@ impl X11Wm {
             client_list_stacking: Vec::new(),
             is_showing_desktop: false,
             focus_release,
+            serial_only,
+            client_id: client.id(),
             span,
         };
 
-        let event_handle = handle.downgrade();
-        let dh = dh.clone();
-        handle.insert_source(source, move |event, _, data| match event {
-            calloop::channel::Event::Msg(event) => {
-                if let Some(event_handle) = event_handle.upgrade() {
-                    if let Err(err) = handle_event(&event_handle, &dh, data, id, event) {
-                        warn!(id = id.0, err = ?err, "Failed to handle X11 event");
-                    }
-                }
-            }
-            calloop::channel::Event::Closed => {
-                data.disconnected(id);
-            }
-        })?;
-        Ok(wm)
+        Ok(PreparedX11Wm {
+            wm,
+            source,
+            focus_source: focus_release_source,
+            client,
+        })
     }
 
     /// Id of this X11 WM
@@ -1682,8 +1747,7 @@ where
                     surface.state.lock().unwrap().override_redirect = false;
 
                     // Read initial _NET_WM_STATE set by the client before mapping.
-                    // Per EWMH spec, clients may set _NET_WM_STATE prior to mapping
-                    // and the window manager must respect it.
+                    // Only advertised states can become accepted initial state.
                     if let Ok(reply) = conn
                         .get_property(false, win, xwm.atoms._NET_WM_STATE, AtomEnum::ATOM, 0, 1024)?
                         .reply()
@@ -1691,14 +1755,18 @@ where
                         if let Some(states) = reply.value32() {
                             let mut state_lock = surface.state.lock().unwrap();
                             for atom in states {
-                                state_lock.net_state.insert(atom);
+                                if xwm.net_supported.contains(&atom) {
+                                    state_lock.net_state.insert(atom);
+                                }
                             }
                         }
                     }
 
                     if let Ok(Some(hints)) = WmHints::get(&*conn, win)?.reply_unchecked() {
                         let mut state = surface.state.lock().unwrap();
-                        if matches!(hints.initial_state, Some(WmHintsState::Iconic)) {
+                        if xwm.net_supported.contains(&xwm.atoms._NET_WM_STATE_HIDDEN)
+                            && matches!(hints.initial_state, Some(WmHintsState::Iconic))
+                        {
                             state.net_state.insert(xwm.atoms._NET_WM_STATE_HIDDEN);
                         } else {
                             state.net_state.remove(&xwm.atoms._NET_WM_STATE_HIDDEN);
@@ -1905,6 +1973,7 @@ where
             }
         }
         Event::DestroyNotify(n) => {
+            xwm.unpaired_surfaces.retain(|_, window| *window != n.window);
             xwm.clipboard.window_destroyed(&n.window, loop_handle);
             xwm.primary.window_destroyed(&n.window, loop_handle);
             xwm.dnd.window_destroyed(&n.window, loop_handle);
@@ -2418,7 +2487,9 @@ where
             if n.detail != NotifyDetail::POINTER
                 && !matches!(n.mode, NotifyMode::GRAB | NotifyMode::UNGRAB) =>
         {
-            if xwm.windows.iter().any(|x| x.window_id() == n.event) {
+            if xwm.net_supported.contains(&xwm.atoms._NET_ACTIVE_WINDOW)
+                && xwm.windows.iter().any(|x| x.window_id() == n.event)
+            {
                 conn.change_property32(
                     PropMode::REPLACE,
                     xwm.screen.root,
@@ -2437,7 +2508,7 @@ where
                 );
             }
             match msg.type_ {
-                x if x == xwm.atoms.WL_SURFACE_ID => {
+                x if x == xwm.atoms.WL_SURFACE_ID && !xwm.serial_only => {
                     let wid = msg.data.as_data32()[0];
                     info!(
                         window = ?msg.window,
@@ -2468,6 +2539,7 @@ where
                         .find(|x| x.window_id() == msg.window || x.mapped_window_id() == Some(msg.window))
                         .cloned()
                     {
+                        let client_id = xwm.client_id.clone();
                         drop(_guard);
 
                         let serial_lo = msg.data.as_data32()[0];
@@ -2476,11 +2548,14 @@ where
 
                         let surface_state = xsurface.state.clone();
                         let mut guard = surface_state.lock().unwrap();
+                        if serial == 0 || guard.wl_surface_serial.is_some_and(|previous| serial <= previous) {
+                            return Ok(());
+                        }
                         guard.wl_surface_serial = Some(serial);
 
                         if let Some(wl_surface) =
                             xwayland_shell::XWaylandShellHandler::xwayland_shell_state(state)
-                                .surface_for_serial(serial)
+                                .take_surface_for_serial(&client_id, serial)
                                 .clone()
                         {
                             debug!(
@@ -2499,7 +2574,13 @@ where
                                 "no matching wl_surface for X11 window",
                             );
                             let xwm = state.xwm_state(xwm_id);
-                            xwm.unpaired_surfaces.insert(serial, xsurface.window_id());
+                            xwm.unpaired_surfaces
+                                .retain(|_, window| *window != xsurface.window_id());
+                            if serial != 0 {
+                                xwm.unpaired_surfaces
+                                    .entry(serial)
+                                    .or_insert(xsurface.window_id());
+                            }
                             std::mem::drop(guard);
                             xsurface.set_wl_surface(state, None);
                         }

@@ -124,7 +124,13 @@
 //! smithay::delegate_dispatch2!(State);
 //! ```
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+};
 
 use tracing::{debug, warn};
 use wayland_protocols::xwayland::shell::v1::server::{
@@ -133,7 +139,7 @@ use wayland_protocols::xwayland::shell::v1::server::{
 };
 use wayland_server::{
     Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
-    backend::GlobalId,
+    backend::{ClientId, GlobalId},
     protocol::wl_surface::{self, WlSurface},
 };
 
@@ -146,13 +152,15 @@ use crate::{
 /// The role for an xwayland-associated surface.
 pub const XWAYLAND_SHELL_ROLE: &str = "xwayland_shell";
 
+struct SurfaceSerialCounter(AtomicU64);
+
 const VERSION: u32 = 1;
 
 /// The global for the xwayland shell protocol.
 #[derive(Debug, Clone)]
 pub struct XWaylandShellState {
     global: GlobalId,
-    by_serial: HashMap<u64, WlSurface>,
+    by_serial: HashMap<(ClientId, u64), WlSurface>,
 }
 
 impl XWaylandShellState {
@@ -177,9 +185,9 @@ impl XWaylandShellState {
         self.global.clone()
     }
 
-    /// Retrieves the surface for a given serial.
-    pub fn surface_for_serial(&self, serial: u64) -> Option<WlSurface> {
-        self.by_serial.get(&serial).cloned()
+    /// Consumes one association from the specified XWayland connection.
+    pub fn take_surface_for_serial(&mut self, client: &ClientId, serial: u64) -> Option<WlSurface> {
+        self.by_serial.remove(&(client.clone(), serial))
     }
 }
 
@@ -187,6 +195,7 @@ impl XWaylandShellState {
 #[derive(Debug, Clone)]
 pub struct XWaylandSurfaceUserData {
     pub(crate) wl_surface: wl_surface::WlSurface,
+    committed: Arc<AtomicBool>,
 }
 
 /// Handler for the xwayland shell protocol.
@@ -211,7 +220,9 @@ pub struct XWaylandShellCachedState {
 
 impl compositor::Cacheable for XWaylandShellCachedState {
     fn commit(&mut self, _dh: &DisplayHandle) -> Self {
-        *self
+        Self {
+            serial: self.serial.take(),
+        }
     }
 
     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
@@ -262,9 +273,18 @@ where
                     return;
                 }
 
-                compositor::add_pre_commit_hook::<D, _>(&surface, serial_commit_hook);
-
-                data_init.init(id, XWaylandSurfaceUserData { wl_surface: surface });
+                let committed = Arc::new(AtomicBool::new(false));
+                let flag = committed.clone();
+                compositor::add_pre_commit_hook::<D, _>(&surface, move |state, dh, surface| {
+                    serial_commit_hook(state, dh, surface, &flag)
+                });
+                data_init.init(
+                    id,
+                    XWaylandSurfaceUserData {
+                        wl_surface: surface,
+                        committed,
+                    },
+                );
                 // We call the handler callback once the serial is set.
             }
             xwayland_shell_v1::Request::Destroy => {
@@ -284,8 +304,8 @@ where
     fn request(
         &self,
         _state: &mut D,
-        _client: &Client,
-        _resource: &XwaylandSurfaceV1,
+        client: &Client,
+        resource: &XwaylandSurfaceV1,
         request: <XwaylandSurfaceV1 as Resource>::Request,
         _dhandle: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
@@ -295,6 +315,27 @@ where
             // This can happen in any order so we need to store the Serial until we have both.
             xwayland_surface_v1::Request::SetSerial { serial_lo, serial_hi } => {
                 let serial = u64::from(serial_lo) | (u64::from(serial_hi) << 32);
+
+                if self.committed.load(Ordering::Relaxed) {
+                    resource.post_error(
+                        xwayland_surface_v1::Error::AlreadyAssociated,
+                        "surface association was already committed",
+                    );
+                    return;
+                }
+                let serials = client
+                    .get_data::<XWaylandClientData>()
+                    .expect("authorized XWayland connection")
+                    .user_data()
+                    .get_or_insert_threadsafe(|| SurfaceSerialCounter(AtomicU64::new(0)));
+                if serial == 0 || serial <= serials.0.load(Ordering::Relaxed) {
+                    resource.post_error(
+                        xwayland_surface_v1::Error::InvalidSerial,
+                        "association serial must be nonzero and strictly increasing",
+                    );
+                    return;
+                }
+                serials.0.store(serial, Ordering::Relaxed);
 
                 // Set the serial on the pending state of surface
                 compositor::with_states(&self.wl_surface, |states| {
@@ -317,6 +358,7 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
     state: &mut D,
     _dh: &DisplayHandle,
     surface: &WlSurface,
+    committed: &AtomicBool,
 ) {
     if let Some(serial) = compositor::with_states(surface, |states| {
         states
@@ -325,7 +367,21 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
             .pending()
             .serial
     }) {
+        committed.store(true, Ordering::Relaxed);
         if let Some(client) = surface.client() {
+            // A surface can commit while the worker is still preparing the WM.
+            // Queue it immediately; installation publishes the XWM identity later.
+            state
+                .xwayland_shell_state()
+                .by_serial
+                .insert((client.id(), serial), surface.clone());
+            let owner = client.id();
+            compositor::add_destruction_hook::<D, _>(surface, move |state, _| {
+                state
+                    .xwayland_shell_state()
+                    .by_serial
+                    .remove(&(owner.clone(), serial));
+            });
             // We only care about surfaces created by XWayland.
             if let Some(xwm_id) = client
                 .get_data::<XWaylandClientData>()
@@ -349,6 +405,10 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
                             "associated X11 window to wl_surface in commit hook",
                         );
 
+                        state
+                            .xwayland_shell_state()
+                            .by_serial
+                            .remove(&(client.id(), serial));
                         xsurface.set_wl_surface(state, Some(surface.clone()));
 
                         XWaylandShellHandler::surface_associated(state, *xwm_id, surface.clone(), xsurface);
@@ -359,17 +419,6 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
                             "Unknown X11 window associated to wl_surface in commit hook"
                         )
                     }
-                } else {
-                    // this is necessary for the atom-handler to look up the matching surface
-                    XWaylandShellHandler::xwayland_shell_state(state)
-                        .by_serial
-                        .insert(serial, surface.clone());
-
-                    compositor::add_destruction_hook::<D, _>(surface, move |state, _| {
-                        XWaylandShellHandler::xwayland_shell_state(state)
-                            .by_serial
-                            .remove(&serial);
-                    });
                 }
             }
         }

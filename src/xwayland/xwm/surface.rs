@@ -1991,7 +1991,7 @@ impl X11Surface {
 
     /// Send a close request to this window.
     ///
-    /// Will outright destroy windows that don't support the `NET_DELETE_WINDOW` protocol.
+    /// Terminates the owning X client when it does not support `WM_DELETE_WINDOW`.
     pub fn close(&self) -> Result<(), ConnectionError> {
         let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
         let state = self.state.lock().unwrap();
@@ -2004,7 +2004,7 @@ impl X11Surface {
             );
             conn.send_event(false, self.window, EventMask::NO_EVENT, event)?;
         } else {
-            conn.destroy_window(self.window)?;
+            conn.kill_client(self.window)?;
         }
         conn.flush()
     }
