@@ -259,12 +259,19 @@ impl Output {
     /// Create a new output with given name and physical properties.
     #[instrument]
     pub fn new(name: String, physical: PhysicalProperties) -> Output {
+        let description = format!("{} - {} - {}", physical.make, physical.model, name);
+        Self::new_with_description(name, physical, description)
+    }
+
+    /// Create a new output with an explicit description before publishing it.
+    #[instrument]
+    pub fn new_with_description(name: String, physical: PhysicalProperties, description: String) -> Output {
         info!(name, "Creating new Output");
 
         let data = Arc::new((
             Mutex::new(Inner {
                 name: name.clone(),
-                description: format!("{} - {} - {}", physical.make, physical.model, name),
+                description,
                 #[cfg(feature = "wayland_frontend")]
                 instances: Vec::new(),
                 #[cfg(feature = "wayland_frontend")]

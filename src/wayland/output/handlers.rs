@@ -166,7 +166,19 @@ where
                 id,
                 output: wl_output,
             } => {
-                let output = Output::from_resource(&wl_output).unwrap();
+                let client_scale = state.client_compositor_state(client).clone_client_scale();
+                let Some(output) = Output::from_resource(&wl_output) else {
+                    // A removed output can still be referenced by an in-flight request.
+                    data_init.init(
+                        id,
+                        XdgOutputUserData {
+                            xdg_output: None,
+                            last_client_scale: AtomicF64::new(client_scale.load(Ordering::Acquire)),
+                            client_scale,
+                        },
+                    );
+                    return;
+                };
                 let mut inner = output.inner.0.lock().unwrap();
 
                 if inner.xdg_output.is_none() {
@@ -174,11 +186,10 @@ where
                 }
                 let xdg_output = inner.xdg_output.as_ref().unwrap();
 
-                let client_scale = state.client_compositor_state(client).clone_client_scale();
                 let id = data_init.init(
                     id,
                     XdgOutputUserData {
-                        xdg_output: xdg_output.clone(),
+                        xdg_output: Some(xdg_output.clone()),
                         last_client_scale: AtomicF64::new(client_scale.load(Ordering::Acquire)),
                         client_scale,
                     },
@@ -195,7 +206,7 @@ where
 /// User data of Xdg Output
 #[derive(Debug)]
 pub struct XdgOutputUserData {
-    xdg_output: XdgOutput,
+    xdg_output: Option<XdgOutput>,
     pub(super) last_client_scale: AtomicF64,
     pub(super) client_scale: Arc<AtomicF64>,
 }
@@ -218,11 +229,13 @@ impl<D> Dispatch2<ZxdgOutputV1, D> for XdgOutputUserData {
         _client_id: wayland_server::backend::ClientId,
         xdg_output: &ZxdgOutputV1,
     ) {
-        self.xdg_output
-            .inner
-            .lock()
-            .unwrap()
-            .instances
-            .retain(|o| o.id() != xdg_output.id());
+        if let Some(output) = &self.xdg_output {
+            output
+                .inner
+                .lock()
+                .unwrap()
+                .instances
+                .retain(|o| o.id() != xdg_output.id());
+        }
     }
 }
