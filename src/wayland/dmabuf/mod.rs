@@ -854,6 +854,7 @@ pub struct ImportNotifier {
     display: DisplayHandle,
     dmabuf: Dmabuf,
     import: Import,
+    sampling_device: Option<libc::dev_t>,
     drop_ignore: bool,
 }
 
@@ -871,6 +872,12 @@ impl ImportNotifier {
     /// Returns the client trying to import this dmabuf, if not dead.
     pub fn client(&self) -> Option<Client> {
         self.inner.client()
+    }
+
+    /// Returns the client's explicit sampling-device target, including unknown devices.
+    /// Unlike `Dmabuf::node`, this does not discard values without a DRM node.
+    pub fn sampling_device(&self) -> Option<libc::dev_t> {
+        self.sampling_device
     }
 
     /// Dmabuf import was successful.
@@ -964,12 +971,19 @@ impl ImportNotifier {
         self.drop_ignore = true;
     }
 
-    fn new(params: ZwpLinuxBufferParamsV1, display: DisplayHandle, dmabuf: Dmabuf, import: Import) -> Self {
+    fn new(
+        params: ZwpLinuxBufferParamsV1,
+        display: DisplayHandle,
+        dmabuf: Dmabuf,
+        import: Import,
+        sampling_device: Option<libc::dev_t>,
+    ) -> Self {
         Self {
             inner: params,
             display,
             dmabuf,
             import,
+            sampling_device,
             drop_ignore: false,
         }
     }

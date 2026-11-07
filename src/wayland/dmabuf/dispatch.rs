@@ -308,8 +308,9 @@ where
                 flags,
             } => {
                 // create_dmabuf performs an implicit ensure_unused function call.
+                let sampling_device = *self.node.lock().unwrap();
                 if let Some(dmabuf) =
-                    self.create_dmabuf(params, width, height, format, flags, *self.node.lock().unwrap())
+                    self.create_dmabuf(params, width, height, format, flags, sampling_device)
                 {
                     if state.dmabuf_state().globals.contains_key(&self.id) {
                         let notifier = ImportNotifier::new(
@@ -317,6 +318,7 @@ where
                             dh.clone(),
                             dmabuf.clone(),
                             Import::Falliable,
+                            sampling_device,
                         );
                         state.dmabuf_imported(&DmabufGlobal { id: self.id }, dmabuf, notifier);
                     } else {
@@ -335,8 +337,9 @@ where
             } => {
                 // Client is killed if the if statement is not taken.
                 // create_dmabuf performs an implicit ensure_unused function call.
+                let sampling_device = *self.node.lock().unwrap();
                 if let Some(dmabuf) =
-                    self.create_dmabuf(params, width, height, format, flags, *self.node.lock().unwrap())
+                    self.create_dmabuf(params, width, height, format, flags, sampling_device)
                 {
                     if state.dmabuf_state().globals.contains_key(&self.id) {
                         // The buffer isn't technically valid during data_init, but the client is not allowed to use the buffer until ready.
@@ -346,6 +349,7 @@ where
                             dh.clone(),
                             dmabuf.clone(),
                             Import::Infallible(buffer),
+                            sampling_device,
                         );
                         state.dmabuf_imported(&DmabufGlobal { id: self.id }, dmabuf, notifier);
                     } else {
