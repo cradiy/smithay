@@ -5,7 +5,7 @@
 
 use libseat::{Seat, SeatEvent};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     os::unix::io::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
     path::Path,
@@ -16,7 +16,11 @@ use std::{
     },
 };
 
-use rustix::{fs::OFlags, io::Errno};
+use rustix::{
+    event::{PollFd, PollFlags, Timespec, poll},
+    fs::OFlags,
+    io::Errno,
+};
 
 use calloop::{
     EventSource, Poll, PostAction, Readiness, Token, TokenFactory,
@@ -31,6 +35,7 @@ use tracing::{debug, info_span, instrument};
 struct LibSeatSessionImpl {
     seat: RefCell<Seat>,
     active: Arc<AtomicBool>,
+    failed: Cell<bool>,
     devices: RefCell<HashMap<RawFd, libseat::Device>>,
 }
 
@@ -58,6 +63,10 @@ pub struct LibSeatSessionNotifier {
 }
 
 impl LibSeatSession {
+    fn live_session(&self) -> Option<Rc<LibSeatSessionImpl>> {
+        self.internal.upgrade().filter(|session| !session.failed.get())
+    }
+
     /// Tries to create a new session via libseat.
     pub fn new() -> Result<(LibSeatSession, LibSeatSessionNotifier), Error> {
         let span = info_span!("backend_session", "type" = "libseat");
@@ -78,37 +87,55 @@ impl LibSeatSession {
         };
 
         drop(_guard);
-        seat.map(|mut seat| {
-            let seat_name = seat.name().to_owned();
+        let mut seat =
+            seat.map_err(|err| Error::FailedToOpenSession(Errno::from_raw_os_error(err.into())))?;
+        let seat_name = seat.name().to_owned();
 
-            // In some cases enable_seat event is available right after startup
-            // so, we can dispatch it
-            seat.dispatch(0).unwrap();
-            let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
+        // In some cases enable_seat is available immediately after startup.
+        dispatch_seat(&mut seat).map_err(Error::FailedToOpenSession)?;
+        let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
 
-            let internal = Rc::new(LibSeatSessionImpl {
-                seat: RefCell::new(seat),
-                active: Arc::new(AtomicBool::new(active)),
-                devices: RefCell::new(HashMap::new()),
-            });
+        let internal = Rc::new(LibSeatSessionImpl {
+            seat: RefCell::new(seat),
+            active: Arc::new(AtomicBool::new(active)),
+            failed: Cell::new(false),
+            devices: RefCell::new(HashMap::new()),
+        });
 
-            let session = LibSeatSession {
-                internal: Rc::downgrade(&internal),
-                seat_name,
-                span: span.clone(),
-            };
+        let session = LibSeatSession {
+            internal: Rc::downgrade(&internal),
+            seat_name,
+            span: span.clone(),
+        };
 
-            let notifier = LibSeatSessionNotifier {
-                internal,
-                rx,
-                token: None,
-                span,
-            };
+        let notifier = LibSeatSessionNotifier {
+            internal,
+            rx,
+            token: None,
+            span,
+        };
 
-            (session, notifier)
-        })
-        .map_err(|err| Error::FailedToOpenSession(Errno::from_raw_os_error(err.into())))
+        Ok((session, notifier))
     }
+}
+
+fn dispatch_seat(seat: &mut Seat) -> Result<(), Errno> {
+    // The seatd backend's dispatch(0) treats socket EOF as zero events.
+    // Check hangup explicitly so a disconnected service cannot spin the loop.
+    let disconnected = {
+        let fd = seat
+            .get_fd()
+            .map_err(|err| Errno::from_raw_os_error(err.into()))?;
+        let mut fds = [PollFd::new(&fd, PollFlags::IN)];
+        poll(&mut fds, Some(&Timespec::default()))?;
+        fds[0].revents().intersects(PollFlags::ERR | PollFlags::HUP)
+    };
+    if disconnected {
+        return Err(Errno::PIPE);
+    }
+    seat.dispatch(0)
+        .map(|_| ())
+        .map_err(|err| Errno::from_raw_os_error(err.into()))
 }
 
 impl Session for LibSeatSession {
@@ -116,7 +143,7 @@ impl Session for LibSeatSession {
 
     #[instrument(parent = &self.span, skip(self))]
     fn open(&mut self, path: &Path, _flags: OFlags) -> Result<OwnedFd, Self::Error> {
-        if let Some(session) = self.internal.upgrade() {
+        if let Some(session) = self.live_session() {
             debug!("Opening device: {:?}", path);
 
             session
@@ -139,7 +166,7 @@ impl Session for LibSeatSession {
 
     #[instrument(parent = &self.span, skip(self))]
     fn close(&mut self, fd: OwnedFd) -> Result<(), Self::Error> {
-        if let Some(session) = self.internal.upgrade() {
+        if let Some(session) = self.live_session() {
             debug!("Closing device: {:?}", fd);
 
             if let Some(dev) = session.devices.borrow_mut().remove(&fd.as_fd().as_raw_fd()) {
@@ -159,7 +186,7 @@ impl Session for LibSeatSession {
 
     #[instrument(parent = &self.span, skip(self))]
     fn change_vt(&mut self, vt: i32) -> Result<(), Self::Error> {
-        if let Some(session) = self.internal.upgrade() {
+        if let Some(session) = self.live_session() {
             debug!("Session switch: {:?}", vt);
             session
                 .seat
@@ -172,7 +199,7 @@ impl Session for LibSeatSession {
     }
 
     fn is_active(&self) -> bool {
-        if let Some(internal) = self.internal.upgrade() {
+        if let Some(internal) = self.live_session() {
             internal.active.load(Ordering::SeqCst)
         } else {
             false
@@ -185,6 +212,17 @@ impl Session for LibSeatSession {
 }
 
 impl LibSeatSessionNotifier {
+    fn fail<F>(&mut self, error: Error, callback: &mut F) -> Error
+    where
+        F: FnMut(SessionEvent, &mut ()),
+    {
+        self.internal.failed.set(true);
+        if self.internal.active.swap(false, Ordering::SeqCst) {
+            callback(SessionEvent::PauseSession, &mut ());
+        }
+        error
+    }
+
     /// Creates a new session object belonging to this notifier.
     pub fn session(&self) -> LibSeatSession {
         LibSeatSession {
@@ -211,29 +249,48 @@ impl EventSource for LibSeatSessionNotifier {
     where
         F: FnMut(SessionEvent, &mut ()),
     {
+        if self.internal.failed.get() {
+            return Err(Error::SessionLost);
+        }
         if Some(token) == self.token {
-            self.internal.seat.borrow_mut().dispatch(0).unwrap();
+            let result = dispatch_seat(&mut self.internal.seat.borrow_mut());
+            if let Err(error) = result {
+                return Err(self.fail(Error::FailedToDispatch(error), &mut callback));
+            }
         }
 
         let internal = &self.internal;
-        self.rx
-            .process_events(readiness, token, |event, _| match event {
-                channel::Event::Msg(event) => match event {
-                    SeatEvent::Enable => {
-                        internal.active.store(true, Ordering::SeqCst);
-                        callback(SessionEvent::ActivateSession, &mut ());
+        let mut failure = None;
+        let result = self
+            .rx
+            .process_events(readiness, token, |event, _| {
+                if failure.is_some() {
+                    return;
+                }
+                match event {
+                    channel::Event::Msg(event) => match event {
+                        SeatEvent::Enable => {
+                            internal.active.store(true, Ordering::SeqCst);
+                            callback(SessionEvent::ActivateSession, &mut ());
+                        }
+                        SeatEvent::Disable => {
+                            internal.active.store(false, Ordering::SeqCst);
+                            callback(SessionEvent::PauseSession, &mut ());
+                            failure = internal.seat.borrow_mut().disable().err().map(|err| {
+                                Error::FailedToDisableSession(Errno::from_raw_os_error(err.into()))
+                            });
+                        }
+                    },
+                    channel::Event::Closed => {
+                        // Tx is stored inside of Seat, and Rc<Seat> is stored in LibSeatSessionNotifier so this is unreachable
                     }
-                    SeatEvent::Disable => {
-                        internal.active.store(false, Ordering::SeqCst);
-                        callback(SessionEvent::PauseSession, &mut ());
-                        internal.seat.borrow_mut().disable().unwrap();
-                    }
-                },
-                channel::Event::Closed => {
-                    // Tx is stored inside of Seat, and Rc<Seat> is stored in LibSeatSessionNotifier so this is unreachable
                 }
             })
-            .map_err(|_| Error::SessionLost)
+            .map_err(|_| Error::SessionLost);
+        match failure.map_or(result, Err) {
+            Ok(action) => Ok(action),
+            Err(error) => Err(self.fail(error, &mut callback)),
+        }
     }
 
     fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
@@ -293,6 +350,14 @@ pub enum Error {
     #[error("Failed to change vt: {0}")]
     FailedToChangeVt(Errno),
 
+    /// Failed to dispatch session events
+    #[error("Failed to dispatch session events: {0}")]
+    FailedToDispatch(Errno),
+
+    /// Failed to acknowledge session suspension
+    #[error("Failed to acknowledge session suspension: {0}")]
+    FailedToDisableSession(Errno),
+
     /// Session is already closed,
     #[error("Session is already closed")]
     SessionLost,
@@ -304,7 +369,9 @@ impl AsErrno for Error {
             &Self::FailedToOpenSession(errno)
             | &Self::FailedToOpenDevice(errno)
             | &Self::FailedToCloseDevice(errno)
-            | &Self::FailedToChangeVt(errno) => Some(errno.raw_os_error()),
+            | &Self::FailedToChangeVt(errno)
+            | &Self::FailedToDispatch(errno)
+            | &Self::FailedToDisableSession(errno) => Some(errno.raw_os_error()),
             _ => None,
         }
     }
