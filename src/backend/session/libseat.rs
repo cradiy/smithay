@@ -93,11 +93,10 @@ impl LibSeatSession {
 
         // In some cases enable_seat is available immediately after startup.
         dispatch_seat(&mut seat).map_err(Error::FailedToOpenSession)?;
-        let active = matches!(rx.try_recv(), Ok(SeatEvent::Enable));
 
         let internal = Rc::new(LibSeatSessionImpl {
             seat: RefCell::new(seat),
-            active: Arc::new(AtomicBool::new(active)),
+            active: Arc::new(AtomicBool::new(false)),
             failed: Cell::new(false),
             devices: RefCell::new(HashMap::new()),
         });
@@ -108,13 +107,16 @@ impl LibSeatSession {
             span: span.clone(),
         };
 
-        let notifier = LibSeatSessionNotifier {
+        let mut notifier = LibSeatSessionNotifier {
             internal,
             rx,
             token: None,
             span,
         };
 
+        let pending: Vec<_> = std::iter::from_fn(|| notifier.rx.try_recv().ok()).collect();
+        // No device access has escaped construction yet.
+        notifier.process_seat_events(&pending, &mut |_, _| {})?;
         Ok((session, notifier))
     }
 }
@@ -212,6 +214,34 @@ impl Session for LibSeatSession {
 }
 
 impl LibSeatSessionNotifier {
+    fn process_seat_events<F>(&mut self, events: &[SeatEvent], callback: &mut F) -> Result<(), Error>
+    where
+        F: FnMut(SessionEvent, &mut ()),
+    {
+        // No enable received before a pending disable is acknowledged can
+        // authorize new device access. Some libseat backends reorder a batch.
+        let disabling = events.iter().any(|event| matches!(event, SeatEvent::Disable));
+        for event in events {
+            match event {
+                SeatEvent::Enable if !disabling => {
+                    self.internal.active.store(true, Ordering::SeqCst);
+                    callback(SessionEvent::ActivateSession, &mut ());
+                }
+                SeatEvent::Enable => {}
+                SeatEvent::Disable => {
+                    self.internal.active.store(false, Ordering::SeqCst);
+                    callback(SessionEvent::PauseSession, &mut ());
+                    self.internal
+                        .seat
+                        .borrow_mut()
+                        .disable()
+                        .map_err(|err| Error::FailedToDisableSession(Errno::from_raw_os_error(err.into())))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn fail<F>(&mut self, error: Error, callback: &mut F) -> Error
     where
         F: FnMut(SessionEvent, &mut ()),
@@ -259,35 +289,18 @@ impl EventSource for LibSeatSessionNotifier {
             }
         }
 
-        let internal = &self.internal;
-        let mut failure = None;
+        let mut events = Vec::new();
         let result = self
             .rx
             .process_events(readiness, token, |event, _| {
-                if failure.is_some() {
-                    return;
-                }
-                match event {
-                    channel::Event::Msg(event) => match event {
-                        SeatEvent::Enable => {
-                            internal.active.store(true, Ordering::SeqCst);
-                            callback(SessionEvent::ActivateSession, &mut ());
-                        }
-                        SeatEvent::Disable => {
-                            internal.active.store(false, Ordering::SeqCst);
-                            callback(SessionEvent::PauseSession, &mut ());
-                            failure = internal.seat.borrow_mut().disable().err().map(|err| {
-                                Error::FailedToDisableSession(Errno::from_raw_os_error(err.into()))
-                            });
-                        }
-                    },
-                    channel::Event::Closed => {
-                        // Tx is stored inside of Seat, and Rc<Seat> is stored in LibSeatSessionNotifier so this is unreachable
-                    }
+                if let channel::Event::Msg(event) = event {
+                    events.push(event);
                 }
             })
             .map_err(|_| Error::SessionLost);
-        match failure.map_or(result, Err) {
+        let result =
+            result.and_then(|action| self.process_seat_events(&events, &mut callback).map(|()| action));
+        match result {
             Ok(action) => Ok(action),
             Err(error) => Err(self.fail(error, &mut callback)),
         }

@@ -23,11 +23,15 @@ impl Drop for ChildGuard {
     }
 }
 
-fn packet(stream: &mut UnixStream, opcode: u16, payload: &[u8]) {
+fn message(opcode: u16, payload: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::from(opcode.to_ne_bytes());
     bytes.extend_from_slice(&(payload.len() as u16).to_ne_bytes());
     bytes.extend_from_slice(payload);
-    stream.write_all(&bytes).unwrap();
+    bytes
+}
+
+fn packet(stream: &mut UnixStream, opcode: u16, payload: &[u8]) {
+    stream.write_all(&message(opcode, payload)).unwrap();
 }
 
 fn request(stream: &mut UnixStream) -> u16 {
@@ -84,11 +88,20 @@ fn with_peer(
     assert!(child.0.wait().unwrap().success());
 }
 
-fn open_seat(seat: &mut UnixStream) {
+fn open_seat_with_events(seat: &mut UnixStream, events: &[u16]) {
     assert_eq!(request(seat), 1); // CLIENT_OPEN_SEAT
     let mut name = Vec::from(6u16.to_ne_bytes());
     name.extend_from_slice(b"seat0\0");
-    packet(seat, SERVER | 1, &name); // SERVER_SEAT_OPENED
+    let mut reply = message(SERVER | 1, &name); // SERVER_SEAT_OPENED
+    for opcode in events {
+        reply.extend_from_slice(&message(*opcode, &[]));
+    }
+    // A single write keeps startup events in the same input batch as seat_opened.
+    seat.write_all(&reply).unwrap();
+}
+
+fn open_seat(seat: &mut UnixStream) {
+    open_seat_with_events(seat, &[]);
 }
 
 fn close_seat(seat: &mut UnixStream) {
@@ -322,16 +335,121 @@ fn startup_dispatch_error_is_returned_without_panicking() {
             );
         },
         |seat, _control| {
-            assert_eq!(request(seat), 1);
-            // One write keeps the unsolicited reply in libseat's input buffer
-            // when the open-seat response is consumed.
-            let mut reply = Vec::from((SERVER | 1).to_ne_bytes());
-            reply.extend_from_slice(&8u16.to_ne_bytes());
-            reply.extend_from_slice(&6u16.to_ne_bytes());
-            reply.extend_from_slice(b"seat0\0");
-            reply.extend_from_slice(&(SERVER | 8).to_ne_bytes());
-            reply.extend_from_slice(&0u16.to_ne_bytes());
-            seat.write_all(&reply).unwrap();
+            open_seat_with_events(seat, &[SERVER | 8]);
+        },
+    );
+}
+
+fn startup_disabled(test: &str, events: &[u16]) {
+    with_peer(
+        test,
+        |mut control| {
+            let (session, notifier) = LibSeatSession::new().unwrap();
+            assert!(
+                !session.is_active(),
+                "startup must include all already received seat events"
+            );
+            control.write_all(b"B").unwrap();
+            let mut event_loop = EventLoop::<bool>::try_new().unwrap();
+            event_loop
+                .handle()
+                .insert_source(notifier, |event, _, enabled| {
+                    assert!(matches!(event, SessionEvent::ActivateSession));
+                    assert!(session.is_active());
+                    *enabled = true;
+                    control.write_all(b"A").unwrap();
+                })
+                .unwrap();
+            let mut enabled = false;
+            while !enabled {
+                event_loop.dispatch(Duration::from_secs(5), &mut enabled).unwrap();
+            }
+        },
+        |seat, control| {
+            open_seat_with_events(seat, events);
+            assert_eq!(
+                request(seat),
+                5,
+                "startup disable must be acknowledged before resources can be initialized"
+            );
+            packet(seat, SERVER | 9, &[]);
+            marker(control, b'B');
+            packet(seat, SERVER | 6, &[]);
+            marker(control, b'A');
+            close_seat(seat);
+        },
+    );
+}
+
+#[test]
+fn startup_disable_is_acknowledged_before_initialization() {
+    startup_disabled(
+        "startup_disable_is_acknowledged_before_initialization",
+        &[SERVER | 5],
+    );
+}
+
+#[test]
+fn startup_enable_cannot_hide_a_queued_disable() {
+    startup_disabled(
+        "startup_enable_cannot_hide_a_queued_disable",
+        &[SERVER | 6, SERVER | 5],
+    );
+}
+
+#[test]
+fn coalesced_disable_requires_a_fresh_activation() {
+    with_peer(
+        "coalesced_disable_requires_a_fresh_activation",
+        |mut control| {
+            let (session, notifier) = LibSeatSession::new().unwrap();
+            let mut writer = control.try_clone().unwrap();
+            let mut event_loop = EventLoop::<Vec<SessionEvent>>::try_new().unwrap();
+            event_loop
+                .handle()
+                .insert_source(notifier, |event, _, events| {
+                    assert_eq!(
+                        session.is_active(),
+                        matches!(event, SessionEvent::ActivateSession)
+                    );
+                    writer
+                        .write_all(match event {
+                            SessionEvent::ActivateSession => b"A",
+                            SessionEvent::PauseSession => b"P",
+                        })
+                        .unwrap();
+                    events.push(event);
+                })
+                .unwrap();
+            control.write_all(b"B").unwrap();
+            let mut events = Vec::new();
+            while events.is_empty() {
+                event_loop.dispatch(Duration::from_secs(5), &mut events).unwrap();
+            }
+            assert!(matches!(events.as_slice(), [SessionEvent::PauseSession]));
+            assert!(!session.is_active());
+            control.write_all(b"S").unwrap();
+            while events.len() < 2 {
+                event_loop.dispatch(Duration::from_secs(5), &mut events).unwrap();
+            }
+            assert!(matches!(
+                events.as_slice(),
+                [SessionEvent::PauseSession, SessionEvent::ActivateSession]
+            ));
+        },
+        |seat, control| {
+            open_seat(seat);
+            marker(control, b'B');
+            let mut batch = message(SERVER | 6, &[]);
+            batch.extend_from_slice(&message(SERVER | 5, &[]));
+            seat.write_all(&batch).unwrap();
+            marker(control, b'P');
+            assert_eq!(request(seat), 5);
+            packet(seat, SERVER | 9, &[]);
+            marker(control, b'S');
+            packet(seat, SERVER | 6, &[]);
+            marker(control, b'A');
+            close_seat(seat);
         },
     );
 }
