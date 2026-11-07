@@ -7,8 +7,11 @@ use std::{
         net::UnixStream,
         process::CommandExt,
     },
-    process::{Child, Command},
-    sync::{Arc, Mutex},
+    process::{Child, Command, ExitStatus},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
 };
 
@@ -211,21 +214,63 @@ impl XWayland {
         A: AsRef<OsStr>,
         F: FnOnce(&UserDataMap),
     {
+        let mut command = Command::new("Xwayland");
+        command.stdout(stdout).stderr(stderr);
+        if clear_env {
+            command.env_clear();
+            for (key, value) in env::vars_os() {
+                if key == "PATH" || key == "XDG_RUNTIME_DIR" {
+                    command.env(key, value);
+                }
+            }
+        }
+        command.envs(envs).args(extra_args);
+        Self::spawn_command_inner(dh, display, command, open_abstract_socket, user_data, true)
+    }
+
+    /// Spawns a compositor-owned command with XWayland's connection descriptors.
+    /// The supplied command owns its executable, environment, extra arguments
+    /// and output streams. WAYLAND_SOCKET always refers to the owned connection.
+    /// The owner must observe process exit with `try_wait`, or drop the handle
+    /// to terminate and asynchronously reap it. User data is retained until
+    /// reaping; use threadsafe entries for resources that require destruction,
+    /// since the fallback reaper runs on another thread.
+    pub fn spawn_with_command<F>(
+        dh: &DisplayHandle,
+        display: impl Into<Option<u32>>,
+        command: Command,
+        open_abstract_socket: bool,
+        user_data: F,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        F: FnOnce(&UserDataMap),
+    {
+        Self::spawn_command_inner(dh, display, command, open_abstract_socket, user_data, false)
+    }
+
+    fn spawn_command_inner<F>(
+        dh: &DisplayHandle,
+        display: impl Into<Option<u32>>,
+        mut command: Command,
+        open_abstract_socket: bool,
+        user_data: F,
+        reap_on_disconnect: bool,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        F: FnOnce(&UserDataMap),
+    {
         let (x_wm_x11, x_wm_me) = UnixStream::pair()?;
         let (wl_x11, wl_me) = UnixStream::pair()?;
-
+        let wayland_socket = if reap_on_disconnect {
+            None
+        } else {
+            Some(wl_me.try_clone()?)
+        };
         let (lock, listen_sockets) = prepare_x11_sockets(display.into(), open_abstract_socket)?;
         let display_number = lock.display_number();
-
-        // XWayland writes the the display number and a newline to this pipe when it's ready.
         let (displayfd_recv, displayfd_send) =
             rustix::pipe::pipe_with(rustix::pipe::PipeFlags::NONBLOCK | rustix::pipe::PipeFlags::CLOEXEC)?;
-
-        let mut command = Command::new("Xwayland");
-
         command
-            .stdout(stdout)
-            .stderr(stderr)
             .arg(format!(":{display_number}"))
             .arg("-verbose")
             .arg("-rootless")
@@ -234,27 +279,12 @@ impl XWayland {
             .arg(x_wm_x11.as_raw_fd().to_string())
             .arg("-displayfd")
             .arg(displayfd_send.as_raw_fd().to_string());
-
         for socket in &listen_sockets {
             command.arg("-listenfd").arg(socket.as_raw_fd().to_string());
         }
-
-        for arg in extra_args {
-            command.arg(arg);
-        }
-
-        if clear_env {
-            // Setup the environment; clear everything except PATH and XDG_RUNTIME_DIR.
-            command.env_clear();
-            for (key, value) in env::vars_os() {
-                if key.to_str() == Some("PATH") || key.to_str() == Some("XDG_RUNTIME_DIR") {
-                    command.env(key, value);
-                }
-            }
-        }
-
-        command.env("WAYLAND_SOCKET", format!("{}", wl_x11.as_raw_fd()));
-        command.envs(envs);
+        command.env("WAYLAND_SOCKET", wl_x11.as_raw_fd().to_string());
+        let data_map = Arc::new(UserDataMap::new());
+        user_data(&data_map);
 
         unsafe {
             let wayland_socket_fd = wl_x11.as_raw_fd();
@@ -284,26 +314,34 @@ impl XWayland {
         let wrapper = unsafe { calloop::generic::FdWrapper::new(displayfd_recv.as_raw_fd()) };
         let source = calloop::generic::Generic::new(wrapper, calloop::Interest::READ, calloop::Mode::Level);
         let inner = Instance {
-            display_lock: lock,
+            display_lock: Arc::new(lock),
             display_fd: displayfd_recv,
             x11_socket: Some(x_wm_me),
+            wayland_socket,
+            child: Arc::new(Mutex::new(Some(child))),
+            data_map: (!reap_on_disconnect).then(|| data_map.clone()),
+            ready: Vec::new(),
+            disconnected: Arc::new(AtomicBool::new(false)),
         };
-
-        let data_map = UserDataMap::new();
-        user_data(&data_map);
 
         // Insert the client into the display handle. The order is important
         // here; XWayland never starts up at all unless it can roundtrip with
         // wayland.
         let inner = Arc::new(Mutex::new(inner));
         let mut dh = dh.clone();
+        let child_handle = inner.lock().unwrap().child.clone();
+        let display_lock = inner.lock().unwrap().display_lock.clone();
+        let disconnected = inner.lock().unwrap().disconnected.clone();
         let client = dh.insert_client(
             wl_me,
             Arc::new(XWaylandClientData {
                 #[cfg(feature = "wayland_frontend")]
                 compositor_state: CompositorClientState::default(),
                 data_map,
-                child: Mutex::new(Some(child)),
+                child: child_handle,
+                display_lock,
+                reap_on_disconnect,
+                disconnected,
             }),
         )?;
 
@@ -316,6 +354,48 @@ impl XWayland {
             },
             client,
         ))
+    }
+
+    /// Whether the Wayland backend reported this connection disconnected.
+    /// This also observes clients killed before backend cleanup has run.
+    pub fn is_disconnected(&self) -> bool {
+        self.inner.lock().unwrap().disconnected.load(Ordering::Relaxed)
+    }
+
+    /// The owned process ID. It remains reserved until `try_wait` reaps it.
+    pub fn process_id(&self) -> u32 {
+        self.inner
+            .lock()
+            .unwrap()
+            .child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("process has not been reaped")
+            .id()
+    }
+
+    /// Transfers the Wayland socket observer to the compositor's outgoing
+    /// backpressure poller. Available once for `spawn_with_command` instances.
+    /// Retire it when the Wayland client disconnects, before dispatching again.
+    pub fn take_wayland_socket(&mut self) -> Option<UnixStream> {
+        self.inner.lock().unwrap().wayland_socket.take()
+    }
+
+    /// Reaps a completed child without blocking. Call after process readiness.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        let inner = self.inner.lock().unwrap();
+        let mut child = inner.child.lock().unwrap();
+        let status = child.as_mut().expect("process has not been reaped").try_wait()?;
+        if status.is_some() {
+            child.take();
+        }
+        Ok(status)
+    }
+
+    /// Requests termination without waiting for the child to exit.
+    pub fn terminate(&mut self) -> std::io::Result<()> {
+        self.inner.lock().unwrap().terminate()
     }
 
     /// Returns the X11 display used by the instance, suitable for setting the
@@ -353,9 +433,14 @@ impl XWayland {
 
 #[derive(Debug)]
 struct Instance {
-    display_lock: X11Lock,
+    display_lock: Arc<X11Lock>,
     x11_socket: Option<UnixStream>,
     display_fd: OwnedFd,
+    wayland_socket: Option<UnixStream>,
+    child: Arc<Mutex<Option<Child>>>,
+    data_map: Option<Arc<UserDataMap>>,
+    ready: Vec<u8>,
+    disconnected: Arc<AtomicBool>,
 }
 
 impl calloop::EventSource for XWayland {
@@ -427,7 +512,33 @@ impl Drop for XWayland {
     }
 }
 
+impl Drop for Instance {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.lock().unwrap().take() {
+            // A caller dropping the source must not block the compositor thread.
+            // Keep endpoint ownership and user guards until wait has reaped it.
+            let _ = child.kill();
+            let lock = self.display_lock.clone();
+            let data = self.data_map.clone();
+            thread::spawn(move || {
+                if let Err(error) = child.wait() {
+                    error!(%error, "Failed to reap XWayland");
+                }
+                drop(lock);
+                drop(data);
+            });
+        }
+    }
+}
+
 impl Instance {
+    fn terminate(&mut self) -> std::io::Result<()> {
+        if let Some(child) = self.child.lock().unwrap().as_mut() {
+            child.kill()?;
+        }
+        Ok(())
+    }
+
     fn take_socket(&mut self) -> std::io::Result<Option<UnixStream>> {
         trace!("checking for XWayland readiness");
 
@@ -441,11 +552,32 @@ impl Instance {
             trace!(?res, "read from XWayland displayfd");
 
             match res {
-                Ok(0) => return Ok(None),
-                Ok(len) if (buf[..len]).contains(&b'\n') => return Ok(self.x11_socket.take()),
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "XWayland exited before readiness",
+                    ));
+                }
+                Ok(len) => {
+                    self.ready.extend_from_slice(&buf[..len]);
+                    if self.ready.len() > 64 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "oversized XWayland readiness",
+                        ));
+                    }
+                    if let Some(line) = self.ready.strip_suffix(b"\n") {
+                        if line != self.display_lock.display_number().to_string().as_bytes() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "incorrect XWayland display number",
+                            ));
+                        }
+                        return Ok(self.x11_socket.take());
+                    }
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
                 Err(err) => return Err(err.into()),
-                _ => continue,
             }
         }
     }
@@ -457,24 +589,37 @@ pub struct XWaylandClientData {
     /// client state of the [`crate::wayland::compositor`] module
     #[cfg(feature = "wayland_frontend")]
     pub compositor_state: CompositorClientState,
-    data_map: UserDataMap,
-    child: Mutex<Option<Child>>,
+    data_map: Arc<UserDataMap>,
+    child: Arc<Mutex<Option<Child>>>,
+    display_lock: Arc<X11Lock>,
+    reap_on_disconnect: bool,
+    disconnected: Arc<AtomicBool>,
 }
 
 impl ClientData for XWaylandClientData {
     fn disconnected(&self, _client_id: ClientId, reason: DisconnectReason) {
+        self.disconnected.store(true, Ordering::Relaxed);
         if let DisconnectReason::ProtocolError(err) = reason {
             error!("Xwayland disconnected: {}", err);
         }
 
-        let mut child = self.child.lock().unwrap().take().unwrap();
-        thread::spawn(move || {
-            if let Ok(status) = child.wait() {
-                if !status.success() {
-                    error!("Xwayland terminated: {}", status);
-                }
+        let mut child = self.child.lock().unwrap();
+        if self.reap_on_disconnect {
+            if let Some(mut child) = child.take() {
+                let _ = child.kill();
+                let lock = self.display_lock.clone();
+                thread::spawn(move || {
+                    if let Err(error) = child.wait() {
+                        error!(%error, "Failed to reap XWayland");
+                    }
+                    drop(lock);
+                });
             }
-        });
+        } else if let Some(child) = child.as_mut() {
+            if let Err(error) = child.kill() {
+                error!(%error, "Failed to terminate disconnected XWayland");
+            }
+        }
     }
 }
 
