@@ -1332,6 +1332,11 @@ impl ShellClient {
         }
     }
 
+    /// The shell resource owning this client's surfaces and protocol errors.
+    pub fn xdg_wm_base(&self) -> &xdg_wm_base::XdgWmBase {
+        &self.kind
+    }
+
     /// Is the shell client represented by this handle still connected?
     #[inline]
     pub fn alive(&self) -> bool {
