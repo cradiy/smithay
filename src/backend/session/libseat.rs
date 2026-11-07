@@ -225,8 +225,8 @@ impl EventSource for LibSeatSessionNotifier {
                     }
                     SeatEvent::Disable => {
                         internal.active.store(false, Ordering::SeqCst);
-                        internal.seat.borrow_mut().disable().unwrap();
                         callback(SessionEvent::PauseSession, &mut ());
+                        internal.seat.borrow_mut().disable().unwrap();
                     }
                 },
                 channel::Event::Closed => {
@@ -309,3 +309,6 @@ impl AsErrno for Error {
         }
     }
 }
+
+#[cfg(all(test, feature = "wayland_frontend"))]
+mod tests;
