@@ -501,7 +501,37 @@ extern "system" fn gl_debug_log(
     });
 }
 
+#[cfg(feature = "backend_gbm")]
+/// Failure to initialize a GBM-backed OpenGL ES renderer.
+#[derive(Debug, thiserror::Error)]
+pub enum GbmRendererError {
+    /// Creating the GBM device failed.
+    #[error("Failed to initialize GBM device: {0}")]
+    Gbm(#[from] std::io::Error),
+    /// Initializing the EGL display or context failed.
+    #[error(transparent)]
+    Egl(#[from] crate::backend::egl::Error),
+    /// Initializing the renderer failed.
+    #[error(transparent)]
+    Gles(#[from] GlesError),
+}
+
 impl GlesRenderer {
+    /// Creates a fresh GBM device and OpenGL ES context from an owned device FD.
+    /// The display and any resources referencing it retain the GBM device.
+    #[cfg(feature = "backend_gbm")]
+    pub fn from_gbm_fd<A: std::os::fd::AsFd + Clone + Send + 'static>(
+        fd: A,
+    ) -> Result<(Self, crate::backend::allocator::gbm::GbmDevice<A>), GbmRendererError> {
+        let gbm = crate::backend::allocator::gbm::GbmDevice::new(fd)?;
+        // SAFETY: This fresh native GBM device has never escaped to external EGL
+        // users. Its display is tracked by Smithay and retains the device.
+        let display = unsafe { crate::backend::egl::EGLDisplay::new(gbm.clone())? };
+        let context = EGLContext::new(&display)?;
+        // SAFETY: This context was created here and cannot be current elsewhere.
+        Ok((unsafe { Self::new(context)? }, gbm))
+    }
+
     /// Get the supported [`Capabilities`](Capability) of the renderer
     ///
     /// # Safety

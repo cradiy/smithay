@@ -23,6 +23,7 @@ pub struct GbmBuffer {
     bo: BufferObject<()>,
     size: Size<i32, BufferCoords>,
     format: Format,
+    owner: Option<crate::utils::DeviceFd>,
 }
 
 impl PlanarBuffer for GbmBuffer {
@@ -117,7 +118,14 @@ impl GbmBuffer {
             bo,
             size,
             format,
+            owner: None,
         }
+    }
+
+    /// Retains the device owner until this buffer's native GBM object is destroyed.
+    pub fn with_owner(mut self, owner: crate::utils::DeviceFd) -> Self {
+        self.owner = Some(owner);
+        self
     }
 
     /// Get the [`DrmNode`] of the device the buffer was allocated when available
