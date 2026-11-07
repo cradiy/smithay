@@ -86,7 +86,7 @@ impl TextInputHandle {
             .iter_mut()
             .find(|instance| instance.instance == *text_input)
         {
-            instance.serial += 1
+            instance.serial = instance.serial.wrapping_add(1)
         }
     }
 
@@ -108,6 +108,9 @@ impl TextInputHandle {
         let mut inner = self.inner.lock().unwrap();
         // Leaving clears the active text input.
         inner.active_text_input_id = None;
+        for instance in &mut inner.instances {
+            instance.pending_state = TextInputState::default();
+        }
         // NOTE: we implement it in a symmetrical way with `enter`.
         inner.with_focused_client_all_text_inputs(|text_input, focus, _| {
             text_input.leave(focus);
@@ -268,12 +271,23 @@ where
 
         match request {
             zwp_text_input_v3::Request::Enable => {
-                pending_state.enable = Some(true);
+                *pending_state = TextInputState {
+                    enable: Some(true),
+                    ..Default::default()
+                };
             }
             zwp_text_input_v3::Request::Disable => {
                 pending_state.enable = Some(false);
             }
             zwp_text_input_v3::Request::SetSurroundingText { text, cursor, anchor } => {
+                if text.len() > 4000
+                    || cursor < 0
+                    || anchor < 0
+                    || !text.is_char_boundary(cursor as usize)
+                    || !text.is_char_boundary(anchor as usize)
+                {
+                    return;
+                }
                 pending_state.surrounding_text = Some((text, cursor as u32, anchor as u32));
             }
             zwp_text_input_v3::Request::SetTextChangeCause { cause } => {
@@ -366,19 +380,12 @@ where
         let deactivate_im = {
             let mut inner = self.handle.inner.lock().unwrap();
             inner.instances.retain(|inst| inst.instance.id() != destroyed_id);
-            let destroyed_focused = inner
-                .focus
-                .as_ref()
-                .map(|focus| focus.id().same_client_as(&destroyed_id))
-                .unwrap_or(true);
-
-            // Deactivate IM when we either lost focus entirely or destroyed text-input for the
-            // currently focused client.
-            destroyed_focused
-                && !inner
-                    .instances
-                    .iter()
-                    .any(|inst| inst.instance.id().same_client_as(&destroyed_id))
+            if inner.active_text_input_id.as_ref() == Some(&destroyed_id) {
+                inner.active_text_input_id = None;
+                true
+            } else {
+                false
+            }
         };
 
         if deactivate_im {

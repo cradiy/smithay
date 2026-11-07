@@ -7,7 +7,7 @@ use tracing::warn;
 use wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_method_keyboard_grab_v2::{
     self, ZwpInputMethodKeyboardGrabV2,
 };
-use wayland_server::{backend::ClientId, protocol::wl_keyboard::KeymapFormat};
+use wayland_server::{Resource, backend::ClientId, protocol::wl_keyboard::KeymapFormat};
 
 use crate::input::{
     SeatHandler,
@@ -138,12 +138,25 @@ impl<D: SeatHandler> fmt::Debug for InputMethodKeyboardUserData<D> {
 }
 
 impl<D: SeatHandler + 'static> Dispatch2<ZwpInputMethodKeyboardGrabV2, D> for InputMethodKeyboardUserData<D> {
-    fn destroyed(&self, state: &mut D, _client: ClientId, _object: &ZwpInputMethodKeyboardGrabV2) {
+    fn destroyed(&self, state: &mut D, _client: ClientId, object: &ZwpInputMethodKeyboardGrabV2) {
         let mut inner = self.handle.inner.lock().unwrap();
+        if !inner.grab.as_ref().is_some_and(|grab| grab.id() == object.id()) {
+            return;
+        }
         inner.grab = None;
         inner.keymap_id = None;
         drop(inner);
-        self.keyboard_handle.unset_grab(state);
+        let ours = self
+            .keyboard_handle
+            .with_grab(|_, current| {
+                current
+                    .downcast_ref::<InputMethodKeyboardGrab>()
+                    .is_some_and(|current| Arc::ptr_eq(&current.inner, &self.handle.inner))
+            })
+            .unwrap_or(false);
+        if ours {
+            self.keyboard_handle.unset_grab(state);
+        }
     }
 
     fn request(

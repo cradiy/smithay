@@ -32,6 +32,14 @@ pub(crate) struct InputMethod {
     pub instance: Option<Instance>,
     pub popup_handle: PopupHandle,
     pub keyboard_grab: InputMethodKeyboardGrab,
+    pending: PendingEdits,
+}
+
+#[derive(Default, Debug)]
+struct PendingEdits {
+    commit: Option<String>,
+    preedit: Option<(String, i32, i32)>,
+    delete: Option<(u32, u32)>,
 }
 
 #[derive(Debug)]
@@ -44,7 +52,7 @@ impl Instance {
     /// Send the done incrementing the serial.
     pub(crate) fn done(&mut self) {
         self.object.done();
-        self.serial += 1;
+        self.serial = self.serial.wrapping_add(1);
     }
 }
 
@@ -148,6 +156,11 @@ impl InputMethodHandle {
     /// Activate input method on the given surface.
     pub(crate) fn activate_input_method<D: SeatHandler + 'static>(&self, state: &mut D, surface: &WlSurface) {
         self.with_input_method(|im| {
+            im.pending = PendingEdits::default();
+            im.popup_handle.rectangle = Rectangle::default();
+            if let Some(popup) = im.popup_handle.surface.as_mut() {
+                popup.set_text_input_rectangle(0, 0, 0, 0);
+            }
             if let Some(instance) = im.instance.as_ref() {
                 instance.object.activate();
                 if let Some(popup) = im.popup_handle.surface.as_mut() {
@@ -173,6 +186,7 @@ impl InputMethodHandle {
     /// The `done` is always send when deactivating IME.
     pub(crate) fn deactivate_input_method<D: SeatHandler + 'static>(&self, state: &mut D) {
         self.with_input_method(|im| {
+            im.pending = PendingEdits::default();
             if let Some(instance) = im.instance.as_mut() {
                 instance.object.deactivate();
                 instance.done();
@@ -254,39 +268,47 @@ where
         }
         match request {
             zwp_input_method_v2::Request::CommitString { text } => {
-                self.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.commit_string(Some(text.clone()));
-                });
+                self.handle.inner.lock().unwrap().pending.commit = Some(text);
             }
             zwp_input_method_v2::Request::SetPreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
             } => {
-                self.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.preedit_string(Some(text.clone()), cursor_begin, cursor_end);
-                });
+                self.handle.inner.lock().unwrap().pending.preedit = Some((text, cursor_begin, cursor_end));
             }
             zwp_input_method_v2::Request::DeleteSurroundingText {
                 before_length,
                 after_length,
             } => {
-                self.text_input_handle.with_active_text_input(|ti, _surface| {
-                    ti.delete_surrounding_text(before_length, after_length);
-                });
+                self.handle.inner.lock().unwrap().pending.delete = Some((before_length, after_length));
             }
             zwp_input_method_v2::Request::Commit { serial } => {
-                let current_serial = self
-                    .handle
-                    .inner
-                    .lock()
-                    .unwrap()
-                    .instance
-                    .as_ref()
-                    .map(|i| i.serial)
-                    .unwrap_or(0);
-
-                self.text_input_handle.done(serial != current_serial);
+                let edits = {
+                    let mut inner = self.handle.inner.lock().unwrap();
+                    let edits = std::mem::take(&mut inner.pending);
+                    if !inner
+                        .instance
+                        .as_ref()
+                        .is_some_and(|instance| instance.serial == serial)
+                    {
+                        return;
+                    }
+                    edits
+                };
+                self.text_input_handle
+                    .with_active_text_input(move |text_input, _| {
+                        if let Some((before, after)) = edits.delete {
+                            text_input.delete_surrounding_text(before, after);
+                        }
+                        if let Some(text) = &edits.commit {
+                            text_input.commit_string(Some(text.clone()));
+                        }
+                        if let Some((text, begin, end)) = &edits.preedit {
+                            text_input.preedit_string(Some(text.clone()), *begin, *end);
+                        }
+                    });
+                self.text_input_handle.done(false);
             }
             zwp_input_method_v2::Request::GetInputPopupSurface { id, surface } => {
                 if compositor::give_role(&surface, INPUT_POPUP_SURFACE_ROLE).is_err()
@@ -370,11 +392,31 @@ where
         }
     }
 
-    fn destroyed(&self, _state: &mut D, _client: ClientId, input_method: &ZwpInputMethodV2) {
-        // Only the active instance leaving frees the seat.
-        if self.handle.is_active_instance(input_method) {
-            self.handle.inner.lock().unwrap().instance = None;
-            self.text_input_handle.leave();
+    fn destroyed(&self, state: &mut D, _client: ClientId, input_method: &ZwpInputMethodV2) {
+        if !self.handle.is_active_instance(input_method) {
+            return;
         }
+        let (popup, grab) = {
+            let mut inner = self.handle.inner.lock().unwrap();
+            inner.instance = None;
+            inner.pending = PendingEdits::default();
+            (inner.popup_handle.surface.take(), inner.keyboard_grab.clone())
+        };
+        if let Some(popup) = popup {
+            state.dismiss_popup(popup);
+        }
+        let ours = self
+            .keyboard_handle
+            .with_grab(|_, current| {
+                current
+                    .downcast_ref::<InputMethodKeyboardGrab>()
+                    .is_some_and(|current| Arc::ptr_eq(&current.inner, &grab.inner))
+            })
+            .unwrap_or(false);
+        grab.inner.lock().unwrap().grab = None;
+        if ours {
+            self.keyboard_handle.unset_grab(state);
+        }
+        self.text_input_handle.leave();
     }
 }

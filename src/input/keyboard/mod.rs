@@ -1256,14 +1256,6 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         bypass_grab: bool,
     ) {
         let mut guard = self.arc.internal.lock().unwrap();
-        match state {
-            KeyState::Pressed => {
-                guard.forwarded_pressed_keys.insert(keycode);
-            }
-            KeyState::Released => {
-                guard.forwarded_pressed_keys.remove(&keycode);
-            }
-        };
 
         // forward to client if no keybinding is triggered.
         // Modifiers are only sent when the shared seat state actually changed; the client
@@ -1661,6 +1653,13 @@ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
         serial: Serial,
         time: InputTime,
     ) {
+        let forward_key = match key_state {
+            KeyState::Pressed => {
+                self.inner.forwarded_pressed_keys.insert(keycode);
+                true
+            }
+            KeyState::Released => self.inner.forwarded_pressed_keys.remove(&keycode),
+        };
         let (focus, _) = match self.inner.focus.as_mut() {
             Some(focus) => focus,
             None => return,
@@ -1678,7 +1677,9 @@ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
             keycode,
         };
 
-        focus.key(self.seat, data, key, key_state, serial, time);
+        if forward_key {
+            focus.key(self.seat, data, key, key_state, serial, time);
+        }
         if let Some(mods) = modifiers {
             focus.modifiers(self.seat, data, mods, serial);
         }
@@ -1751,6 +1752,7 @@ impl<D: SeatHandler + 'static> KeyboardInnerHandle<'_, D> {
         } else if let Some((old_focus, _)) = self.inner.focus.take() {
             trace!("Focus unset");
             old_focus.leave(self.seat, data, serial);
+            data.focus_changed(self.seat, None);
         }
     }
 }

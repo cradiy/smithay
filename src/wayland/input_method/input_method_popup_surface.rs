@@ -96,7 +96,9 @@ impl PopupSurface {
         *self.rectangle.lock().unwrap()
     }
 
-    /// Set relative location of text cursor.
+    /// Set the protected cursor rectangle in parent-surface coordinates.
+    /// The compositor sends the popup-local `text_input_rectangle` event after
+    /// selecting the popup location. This only updates placement state.
     ///
     /// Setting this value **will update** the [`location`] to the new `x` and `y`.
     ///
@@ -104,7 +106,6 @@ impl PopupSurface {
     pub fn set_text_input_rectangle(&mut self, x: i32, y: i32, width: i32, height: i32) {
         *self.rectangle.lock().unwrap() = Rectangle::new((x, y).into(), (width, height).into());
         *self.location.lock().unwrap() = (x, y).into();
-        self.surface_role.text_input_rectangle(x, y, width, height);
     }
 }
 
