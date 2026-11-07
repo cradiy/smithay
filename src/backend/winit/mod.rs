@@ -595,6 +595,29 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                 };
                 (self.callback)(WinitEvent::Input(event));
             }
+            WindowEvent::PointerEntered {
+                position,
+                kind: PointerKind::Mouse,
+                ..
+            }
+            | WindowEvent::PointerMoved {
+                position,
+                source: PointerSource::Mouse,
+                ..
+            } => {
+                let size = window.surface_size();
+                let event = InputEvent::PointerMotionAbsolute {
+                    event: WinitMouseMovedEvent {
+                        time: self.timestamp(),
+                        position: RelativePosition::new(
+                            position.x / size.width as f64,
+                            position.y / size.height as f64,
+                        ),
+                        global_position: position,
+                    },
+                };
+                (self.callback)(WinitEvent::Input(event));
+            }
             WindowEvent::PointerMoved { position, source, .. } => {
                 let size = window.surface_size();
                 let x = position.x / size.width as f64;
@@ -602,16 +625,6 @@ impl<F: FnMut(WinitEvent)> ApplicationHandler for WinitEventLoopApp<'_, F> {
                 let relative_position = RelativePosition::new(x, y);
 
                 match source {
-                    PointerSource::Mouse => {
-                        let event = InputEvent::PointerMotionAbsolute {
-                            event: WinitMouseMovedEvent {
-                                time: self.timestamp(),
-                                position: relative_position,
-                                global_position: position,
-                            },
-                        };
-                        (self.callback)(WinitEvent::Input(event));
-                    }
                     PointerSource::Touch { finger_id, force: _ } => {
                         let event = InputEvent::TouchMotion {
                             event: WinitTouchMovedEvent {
