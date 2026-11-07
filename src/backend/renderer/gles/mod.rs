@@ -520,9 +520,15 @@ impl GlesRenderer {
     /// Creates a fresh GBM device and OpenGL ES context from an owned device FD.
     /// The display and any resources referencing it retain the GBM device.
     #[cfg(feature = "backend_gbm")]
-    pub fn from_gbm_fd<A: std::os::fd::AsFd + Clone + Send + 'static>(
-        fd: A,
-    ) -> Result<(Self, crate::backend::allocator::gbm::GbmDevice<A>), GbmRendererError> {
+    pub fn from_gbm_fd(
+        fd: crate::utils::DeviceFd,
+    ) -> Result<
+        (
+            Self,
+            crate::backend::allocator::gbm::GbmDevice<crate::utils::DeviceFd>,
+        ),
+        GbmRendererError,
+    > {
         let gbm = crate::backend::allocator::gbm::GbmDevice::new(fd)?;
         // SAFETY: This fresh native GBM device has never escaped to external EGL
         // users. Its display is tracked by Smithay and retains the device.
