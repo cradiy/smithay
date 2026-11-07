@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
@@ -24,10 +25,10 @@ use zwp_primary_selection_offer_v1::Request as PrimaryRequest;
 
 use crate::input::Seat;
 
-use super::SelectionHandler;
 use super::device::{DataDeviceKind, SelectionDevice};
 use super::private::selection_dispatch;
 use super::source::{CompositorSelectionProvider, SelectionSourceProvider};
+use super::{SelectionHandler, SelectionTarget, seat_data::SeatData};
 
 #[derive(Debug, Clone)]
 pub enum OfferReplySource<U: Clone + Send + Sync + 'static> {
@@ -70,6 +71,8 @@ impl SelectionOffer {
         device: &SelectionDevice,
         client_id: ClientId,
         data: OfferReplySource<D::SelectionUserData>,
+        target: SelectionTarget,
+        generation: (u64, u64),
     ) -> Self
     where
         D: SelectionHandler + 'static,
@@ -80,6 +83,9 @@ impl SelectionOffer {
         let device_kind = device.device_kind();
         let data = Arc::new(OfferReplyData {
             device_kind,
+            device: device.clone(),
+            target,
+            generation,
             seat: device.seat(),
             source: data,
         });
@@ -115,6 +121,9 @@ impl SelectionOffer {
 
 struct OfferReplyData<U: Clone + Send + Sync + 'static> {
     device_kind: DataDeviceKind,
+    device: SelectionDevice,
+    target: SelectionTarget,
+    generation: (u64, u64),
     source: OfferReplySource<U>,
     seat: WlSeat,
 }
@@ -132,19 +141,40 @@ where
     ) -> Option<Arc<dyn ObjectData<D>>> {
         let dh = DisplayHandle::from(dh.clone());
 
+        let seat = Seat::<D>::from_resource(&self.seat)?;
+        let current = seat
+            .user_data()
+            .get::<RefCell<SeatData<D::SelectionUserData>>>()
+            .is_some_and(|data| {
+                data.borrow()
+                    .offer_is_current(&self.device, self.target, self.generation)
+            });
+        if !current {
+            return None;
+        }
+
         // NOTE: we can't parse message more than once, since it expects the `OwnedFd` which
         // we can't clone. To achieve that, we use RTTI passed along the selection data, to
         // make the parsing work only once.
         let (mime_type, fd, object_name) = match self.device_kind {
-            DataDeviceKind::Core => {
-                if let Ok((_resource, DataOfferRequest::Receive { mime_type, fd })) =
-                    WlDataOffer::parse_request(&dh, msg)
-                {
-                    (mime_type, fd, "wl_data_offer")
-                } else {
+            DataDeviceKind::Core => match WlDataOffer::parse_request(&dh, msg) {
+                Ok((_, DataOfferRequest::Receive { mime_type, fd })) => (mime_type, fd, "wl_data_offer"),
+                Ok((offer, DataOfferRequest::Finish)) => {
+                    offer.post_error(
+                        wl_data_offer::Error::InvalidFinish,
+                        "Clipboard offers cannot be finished.",
+                    );
                     return None;
                 }
-            }
+                Ok((offer, DataOfferRequest::SetActions { .. })) => {
+                    offer.post_error(
+                        wl_data_offer::Error::InvalidOffer,
+                        "Clipboard offers have no drag actions.",
+                    );
+                    return None;
+                }
+                _ => return None,
+            },
             DataDeviceKind::Primary => {
                 if let Ok((_resource, PrimaryRequest::Receive { mime_type, fd })) =
                     PrimaryOffer::parse_request(&dh, msg)

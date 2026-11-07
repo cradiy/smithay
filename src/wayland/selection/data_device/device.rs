@@ -66,85 +66,50 @@ where
                 icon,
                 serial,
             } => {
-                // NOTE: While protocol states that selection shouldn't be used more than once,
-                // no-one enforces it, thus we have clients around that do so and crashing them
-                // doesn't worth it at this point.
+                let serial = Serial::from(serial);
+                let kind = if seat.get_pointer().is_some_and(|pointer| pointer.has_grab(serial)) {
+                    GrabType::Pointer
+                } else if seat.get_touch().is_some_and(|touch| touch.has_grab(serial)) {
+                    GrabType::Touch
+                } else {
+                    debug!(serial = ?serial, client = ?client, "denying drag from client without implicit grab");
+                    return;
+                };
+                if !handler.allow_dnd(&seat, &origin, serial) {
+                    return;
+                }
                 if let Some(source) = source.as_ref() {
+                    if handler.data_device_state().used_sources.contains_key(source) {
+                        resource.post_error(
+                            wl_data_device::Error::UsedSource,
+                            "Data source has already been used.",
+                        );
+                        return;
+                    }
                     handler
                         .data_device_state()
                         .used_sources
                         .insert(source.clone(), self.wl_seat.clone());
                 }
-
-                let serial = Serial::from(serial);
-                if let Some(pointer) = seat.get_pointer() {
-                    if pointer.has_grab(serial) {
-                        if let Some(ref icon) = icon {
-                            if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
-                                resource.post_error(
-                                    wl_data_device::Error::Role,
-                                    "Given surface already has an other role",
-                                );
-                                return;
-                            }
-                        }
-                        // The StartDrag is in response to a pointer implicit grab, all is good
-                        if let Some(source) = source {
-                            handler.dnd_requested(
-                                source,
-                                icon.clone(),
-                                seat.clone(),
-                                serial,
-                                GrabType::Pointer,
-                            );
-                        } else {
-                            handler.dnd_requested(
-                                origin,
-                                icon.clone(),
-                                seat.clone(),
-                                serial,
-                                GrabType::Pointer,
-                            );
-                        }
-
+                if let Some(ref icon) = icon {
+                    if compositor::give_role(icon, DND_ICON_ROLE).is_err()
+                        && compositor::get_role(icon) != Some(DND_ICON_ROLE)
+                    {
+                        resource.post_error(
+                            wl_data_device::Error::Role,
+                            "Given surface already has another role.",
+                        );
                         return;
                     }
                 }
-                if let Some(touch) = seat.get_touch() {
-                    if touch.has_grab(serial) {
-                        if let Some(ref icon) = icon {
-                            if compositor::give_role(icon, DND_ICON_ROLE).is_err() {
-                                resource.post_error(
-                                    wl_data_device::Error::Role,
-                                    "Given surface already has an other role",
-                                );
-                                return;
-                            }
-                        }
-                        // The StartDrag is in response to a touch implicit grab, all is good
-                        if let Some(source) = source {
-                            handler.dnd_requested(
-                                source,
-                                icon.clone(),
-                                seat.clone(),
-                                serial,
-                                GrabType::Touch,
-                            );
-                        } else {
-                            handler.dnd_requested(
-                                origin,
-                                icon.clone(),
-                                seat.clone(),
-                                serial,
-                                GrabType::Touch,
-                            );
-                        }
-                        return;
-                    }
+                if let Some(source) = source {
+                    handler.dnd_requested(source, icon, seat, serial, kind);
+                } else {
+                    handler.dnd_requested(origin, icon, seat, serial, kind);
                 }
-                debug!(serial = ?serial, client = ?client, "denying drag from client without implicit grab");
             }
-            wl_data_device::Request::SetSelection { source, .. } => {
+
+            wl_data_device::Request::SetSelection { source, serial } => {
                 let seat_data = match seat.get_keyboard() {
                     Some(keyboard) if keyboard.client_of_object_has_focus(&resource.id()) => seat
                         .user_data()
@@ -159,10 +124,30 @@ where
                     }
                 };
 
-                // NOTE: While protocol states that selection shouldn't be used more than once,
-                // no-one enforces it, thus we have clients around that do so and crashing them
-                // doesn't worth it at this point.
+                if !handler.allow_selection(&seat, serial.into()) {
+                    return;
+                }
+
                 if let Some(source) = source.as_ref() {
+                    if handler.data_device_state().used_sources.contains_key(source) {
+                        resource.post_error(
+                            wl_data_device::Error::UsedSource,
+                            "Data source has already been used.",
+                        );
+                        return;
+                    }
+                    if source
+                        .data::<super::DataSourceUserData>()
+                        .unwrap()
+                        .actions_set
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        source.post_error(
+                            wayland_server::protocol::wl_data_source::Error::InvalidSource,
+                            "Drag sources cannot become clipboard selections.",
+                        );
+                        return;
+                    }
                     handler
                         .data_device_state()
                         .used_sources

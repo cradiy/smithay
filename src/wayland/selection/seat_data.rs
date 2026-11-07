@@ -11,6 +11,8 @@ use super::{SelectionHandler, SelectionTarget};
 /// The data is shared across primary, data device, and data control selections.
 pub(crate) struct SeatData<U: Clone + Sync + Send + 'static> {
     known_devices: Vec<SelectionDevice>,
+    clipboard_generation: (u64, u64),
+    primary_generation: (u64, u64),
     clipboard_selection: Option<OfferReplySource<U>>,
     clipboard_selection_focus: Option<Client>,
     primary_selection: Option<OfferReplySource<U>>,
@@ -49,6 +51,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
         if self.clipboard_selection_focus != new_focus {
+            self.clipboard_generation.1 = self.clipboard_generation.1.wrapping_add(1);
             self.clipboard_selection_focus = new_focus;
             self.send_selection::<D>(dh, SelectionTarget::Clipboard, None, false)
         }
@@ -69,6 +72,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                 _ => source.cancel(),
             }
         }
+        self.clipboard_generation.0 = self.clipboard_generation.0.wrapping_add(1);
         self.clipboard_selection = new_selection;
         self.send_selection::<D>(dh, SelectionTarget::Clipboard, None, true)
     }
@@ -82,6 +86,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
         if self.primary_selection_focus != new_focus {
+            self.primary_generation.1 = self.primary_generation.1.wrapping_add(1);
             self.primary_selection_focus = new_focus;
             self.send_selection::<D>(dh, SelectionTarget::Primary, None, false)
         }
@@ -99,6 +104,7 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                 _ => source.cancel(),
             }
         }
+        self.primary_generation.0 = self.primary_generation.0.wrapping_add(1);
         self.primary_selection = new_selection;
         self.send_selection::<D>(dh, SelectionTarget::Primary, None, true)
     }
@@ -111,6 +117,25 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     /// Get the current selection which will be used as a primary selection.
     pub fn get_primary_selection(&self) -> Option<&OfferReplySource<U>> {
         self.primary_selection.as_ref()
+    }
+
+    pub fn offer_is_current(
+        &self,
+        device: &SelectionDevice,
+        ty: SelectionTarget,
+        generation: (u64, u64),
+    ) -> bool {
+        let current = match ty {
+            SelectionTarget::Clipboard => self.clipboard_generation,
+            SelectionTarget::Primary => self.primary_generation,
+        };
+        let needs_focus = matches!(
+            device,
+            SelectionDevice::DataDevice(_) | SelectionDevice::Primary(_)
+        );
+        current.0 == generation.0
+            && (!needs_focus || current.1 == generation.1)
+            && self.known_devices.contains(device)
     }
 
     /// Send selection for the given [`SelectionTarget`]. The data control devices should only
@@ -131,6 +156,10 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
     ) where
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
+        let generation = match ty {
+            SelectionTarget::Clipboard => self.clipboard_generation,
+            SelectionTarget::Primary => self.primary_generation,
+        };
         let (client, selection) = match ty {
             SelectionTarget::Primary => (self.primary_selection_focus.as_ref(), &mut self.primary_selection),
             SelectionTarget::Clipboard => (
@@ -197,7 +226,8 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
                         None => continue,
                     };
 
-                    let offer = SelectionOffer::new::<D>(dh, device, client_id, selection.clone());
+                    let offer =
+                        SelectionOffer::new::<D>(dh, device, client_id, selection.clone(), ty, generation);
 
                     device.offer(&offer);
 
@@ -219,6 +249,8 @@ impl<U: Clone + Send + Sync + 'static> Default for SeatData<U> {
     fn default() -> Self {
         Self {
             known_devices: Vec::new(),
+            clipboard_generation: (0, 0),
+            primary_generation: (0, 0),
             clipboard_selection: None,
             clipboard_selection_focus: None,
             primary_selection: None,

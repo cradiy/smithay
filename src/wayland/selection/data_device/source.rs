@@ -4,7 +4,7 @@ use std::{
     os::fd::{AsFd, OwnedFd},
     sync::Mutex,
 };
-use tracing::{debug, error};
+use tracing::debug;
 
 use wayland_server::{
     DisplayHandle, Resource,
@@ -32,6 +32,7 @@ use super::DataDeviceHandler;
 pub struct DataSourceUserData {
     pub(crate) inner: Mutex<SourceMetadata>,
     alive_tracker: AliveTracker,
+    pub(super) actions_set: std::sync::atomic::AtomicBool,
     display_handle: DisplayHandle,
 }
 
@@ -40,6 +41,7 @@ impl DataSourceUserData {
         Self {
             inner: Default::default(),
             alive_tracker: Default::default(),
+            actions_set: Default::default(),
             display_handle,
         }
     }
@@ -52,9 +54,9 @@ where
 {
     fn request(
         &self,
-        _state: &mut D,
+        state: &mut D,
         _client: &wayland_server::Client,
-        _resource: &WlDataSource,
+        resource: &WlDataSource,
         request: wl_data_source::Request,
         _dhandle: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
@@ -65,14 +67,24 @@ where
             wl_data_source::Request::Offer { mime_type } => {
                 data.mime_types.push(mime_type);
             }
-            wl_data_source::Request::SetActions { dnd_actions } => match dnd_actions {
-                wayland_server::WEnum::Value(dnd_actions) => {
-                    data.dnd_actions = DndAction::vec_from_wl(dnd_actions);
+            wl_data_source::Request::SetActions { dnd_actions } => {
+                if self.actions_set.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    || state.data_device_state().used_sources.contains_key(resource)
+                {
+                    resource.post_error(
+                        wl_data_source::Error::InvalidSource,
+                        "Source actions must be set once before use.",
+                    );
+                    return;
                 }
-                wayland_server::WEnum::Unknown(action) => {
-                    error!("Unknown dnd_action: {:?}", action);
+                match dnd_actions.into_result() {
+                    Ok(actions) => data.dnd_actions = DndAction::vec_from_wl(actions),
+                    Err(_) => resource.post_error(
+                        wl_data_source::Error::InvalidActionMask,
+                        "Invalid source action mask.",
+                    ),
                 }
-            },
+            }
             wl_data_source::Request::Destroy => {}
             _ => unreachable!(),
         }
@@ -119,13 +131,24 @@ impl IsAlive for WlDataSource {
 }
 
 impl Source for WlDataSource {
+    fn accepted(&self, mime_type: Option<String>) {
+        self.target(mime_type);
+    }
+
     fn metadata(&self) -> Option<SourceMetadata> {
-        self.data::<DataSourceUserData>()
-            .map(|data| data.inner.lock().unwrap().clone())
+        self.data::<DataSourceUserData>().map(|data| {
+            let mut metadata = data.inner.lock().unwrap().clone();
+            if self.version() < 3 {
+                metadata.dnd_actions = [DndAction::Copy].into_iter().collect();
+            }
+            metadata
+        })
     }
 
     fn choose_action(&self, action: DndAction) {
-        self.action(action.into());
+        if self.version() >= wl_data_source::EVT_ACTION_SINCE {
+            self.action(action.into());
+        }
     }
 
     fn send(&self, mime_type: &str, fd: OwnedFd) {

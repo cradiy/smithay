@@ -224,6 +224,11 @@ where
     S: Source,
     F: DndFocus<D> + 'static,
 {
+    /// Access the source whose lifetime controls this grab.
+    pub fn source(&self) -> Arc<S> {
+        self.data_source.clone()
+    }
+
     fn update_focus(
         &mut self,
         data: &mut D,
@@ -257,13 +262,10 @@ where
 
             let (x, y) = (location - surface_location).into();
             if self.current_focus.is_none() {
-                if self
-                    .data_source
-                    .metadata()
-                    .is_some_and(|metadata| metadata.mime_types.is_empty())
-                {
-                    // delay until they have materialized
-                    return;
+                match self.data_source.metadata() {
+                    Some(metadata) if metadata.mime_types.is_empty() => return,
+                    None if !self.data_source.is_client_local(&focus) => return,
+                    _ => (),
                 }
 
                 // We entered a new surface, send the data offer if appropriate
@@ -301,8 +303,10 @@ where
     fn drop<'a>(&'a mut self, data: &mut D, into_target: impl Fn(&'a F) -> DndTarget<'a, D>) {
         // the user dropped, proceed to the drop
         let validated = self.offer_data.as_ref().is_some_and(|data| data.validated());
-        if let Some(ref focus) = self.current_focus {
-            focus.drop(data, self.offer_data.as_mut(), &self.seat);
+        if validated || self.data_source.metadata().is_none() {
+            if let Some(ref focus) = self.current_focus {
+                focus.drop(data, self.offer_data.as_mut(), &self.seat);
+            }
         }
 
         if let Some(ref offer_data) = self.offer_data {
@@ -328,8 +332,10 @@ where
         );
         // in all cases abandon the drop
         // no more buttons are pressed, release the grab
-        if let Some(ref focus) = self.current_focus {
-            focus.leave(data, self.offer_data.as_mut(), &self.seat);
+        if !validated {
+            if let Some(ref focus) = self.current_focus {
+                focus.leave(data, self.offer_data.as_mut(), &self.seat);
+            }
         }
     }
 }

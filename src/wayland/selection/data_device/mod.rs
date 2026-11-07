@@ -123,6 +123,18 @@ pub trait DataDeviceHandler: Sized + SelectionHandler + WaylandDndGrabHandler {
     /// [DataDeviceState] getter
     fn data_device_state(&mut self) -> &mut DataDeviceState;
 
+    /// Authorize the origin and compositor state after validating the implicit grab serial.
+    fn allow_dnd(&mut self, seat: &Seat<Self>, origin: &WlSurface, serial: Serial) -> bool {
+        let _ = (seat, origin, serial);
+        true
+    }
+
+    /// Authorize the input serial of a focused client's selection request.
+    fn allow_selection(&mut self, seat: &Seat<Self>, serial: Serial) -> bool {
+        let _ = (seat, serial);
+        true
+    }
+
     /// Action chooser for DnD negotiation
     fn action_choice(&mut self, available: WlDndAction, preferred: WlDndAction) -> WlDndAction {
         default_action_chooser(available, preferred)
@@ -208,6 +220,8 @@ struct WlOfferState {
 }
 
 struct WlDndDataOffer<S: Source> {
+    serial: Serial,
+    version: u32,
     state: Arc<Mutex<WlOfferState>>,
     source: Mutex<Option<Arc<S>>>,
 }
@@ -240,6 +254,18 @@ where
         _client_id: ClientId,
         _object_id: ObjectId,
     ) {
+        let mut source = self.source.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        if state.active && state.dropped && !state.finished {
+            if let Some(source) = source.take() {
+                if self.version < 3 {
+                    source.finished();
+                } else {
+                    source.cancel();
+                }
+            }
+            state.active = false;
+        }
     }
 }
 
@@ -255,123 +281,133 @@ fn handle_dnd<D, S>(
 {
     use self::wl_data_offer::Request;
     let mut source = data.source.lock().unwrap();
-    let mut data = data.state.lock().unwrap();
+    let mut state = data.state.lock().unwrap();
+    if state.finished && !matches!(request, Request::Destroy) {
+        offer.post_error(wl_data_offer::Error::InvalidFinish, "Request after Finish.");
+        return;
+    }
+    if !state.active {
+        return;
+    }
     match request {
-        Request::Accept { mime_type, .. } => {
+        Request::Accept { serial, mime_type } => {
+            if Serial::from(serial) != data.serial {
+                return;
+            }
             if let Some(source) = source.as_ref() {
-                data.accepted = match &mime_type {
-                    Some(mtype) => source
+                state.accepted = mime_type.as_ref().is_some_and(|mime| {
+                    source
                         .metadata()
-                        .is_some_and(|meta| meta.mime_types.contains(mtype)),
-                    None => false,
-                };
-                source.accepted(mime_type);
-            } else if data.finished {
-                offer.post_error(
-                    wl_data_offer::Error::InvalidFinish,
-                    "Accept request after Finish.",
-                );
+                        .is_some_and(|meta| meta.mime_types.contains(mime))
+                });
+                source.accepted(if state.accepted { mime_type } else { None });
             }
         }
         Request::Receive { mime_type, fd } => {
             if let Some(source) = source.as_ref() {
-                // check if the source and associated mime type is still valid
-                let valid = source
-                    .metadata()
-                    .is_some_and(|meta| meta.mime_types.contains(&mime_type))
-                    && source.alive()
-                    && data.active;
-                if valid {
+                if source.alive()
+                    && source
+                        .metadata()
+                        .is_some_and(|meta| meta.mime_types.contains(&mime_type))
+                {
                     source.send(&mime_type, fd);
                 }
-            } else if data.finished {
-                offer.post_error(
-                    wl_data_offer::Error::InvalidFinish,
-                    "Receive request after Finish.",
-                );
             }
         }
         Request::Destroy => {
-            if data.dropped && !data.finished {
-                if let Some(source) = source.as_ref() {
-                    source.cancel();
+            if state.dropped && !state.finished {
+                if let Some(source) = source.take() {
+                    if data.version < 3 {
+                        source.finished();
+                    } else {
+                        source.cancel();
+                    }
                 }
+                state.active = false;
             }
         }
         Request::Finish => {
-            if data.chosen_action.is_empty() {
+            if !state.dropped
+                || !state.accepted
+                || ![WlDndAction::Copy, WlDndAction::Move].contains(&state.chosen_action)
+            {
                 offer.post_error(
                     wl_data_offer::Error::InvalidFinish,
-                    "Cannot finish a data offer with no valid action.",
+                    "Finish requires an accepted drop with a final action.",
                 );
                 return;
             }
             if let Some(source) = source.take() {
-                if data.accepted {
-                    source.finished();
-                }
-            } else if data.finished {
-                offer.post_error(
-                    wl_data_offer::Error::InvalidFinish,
-                    "Cannot finish a data offer, which was finished already.",
-                );
+                source.finished();
             }
-            data.active = false;
-            data.finished = true;
+            state.active = false;
+            state.finished = true;
         }
         Request::SetActions {
             dnd_actions,
             preferred_action,
         } => {
+            let Ok(actions) = dnd_actions.into_result() else {
+                offer.post_error(
+                    wl_data_offer::Error::InvalidActionMask,
+                    "Invalid destination action mask.",
+                );
+                return;
+            };
+            let Ok(preferred) = preferred_action.into_result() else {
+                offer.post_error(wl_data_offer::Error::InvalidAction, "Invalid preferred action.");
+                return;
+            };
+            if ![
+                WlDndAction::None,
+                WlDndAction::Copy,
+                WlDndAction::Move,
+                WlDndAction::Ask,
+            ]
+            .contains(&preferred)
+                || !actions.contains(preferred)
+            {
+                offer.post_error(
+                    wl_data_offer::Error::InvalidAction,
+                    "Preferred action must be one of the destination actions.",
+                );
+                return;
+            }
+            if state.dropped && state.chosen_action != WlDndAction::Ask {
+                offer.post_error(
+                    wl_data_offer::Error::InvalidOffer,
+                    "A final drop action cannot be changed.",
+                );
+                return;
+            }
             if let Some(source) = source.as_ref() {
-                let dnd_actions = dnd_actions.into_result().unwrap_or(WlDndAction::None);
-                let preferred_action = preferred_action.into_result().unwrap_or(WlDndAction::None);
-
-                // preferred_action must only contain one bitflag at the same time
-                if ![
-                    WlDndAction::None,
-                    WlDndAction::Move,
-                    WlDndAction::Copy,
-                    WlDndAction::Ask,
-                ]
-                .contains(&preferred_action)
-                {
-                    offer.post_error(wl_data_offer::Error::InvalidAction, "Invalid preferred action.");
-                    return;
-                }
-
-                let source_actions = source
+                let available = source
                     .metadata()
                     .map(|meta| DndAction::convert_slice(&meta.dnd_actions))
                     .unwrap_or_else(WlDndAction::empty);
-                let possible_actions = source_actions & dnd_actions;
-                let chosen_action = handler.action_choice(possible_actions, preferred_action);
-                // check that the user provided callback respects that one precise action should be chosen
+                if state.dropped && (!available.contains(preferred) || preferred == WlDndAction::Ask) {
+                    offer.post_error(
+                        wl_data_offer::Error::InvalidAction,
+                        "Ask must resolve to a supported final action.",
+                    );
+                    return;
+                }
+                let chosen = handler.action_choice(available & actions, preferred);
                 debug_assert!(
                     [
                         WlDndAction::None,
-                        WlDndAction::Move,
                         WlDndAction::Copy,
+                        WlDndAction::Move,
                         WlDndAction::Ask
                     ]
-                    .contains(&chosen_action),
-                    "Only one precise action should be chosen"
+                    .contains(&chosen)
+                        && (available & actions).contains(chosen)
                 );
-                if chosen_action != data.chosen_action {
-                    data.chosen_action = chosen_action;
-                    if offer.version() >= wl_data_offer::EVT_ACTION_SINCE {
-                        offer.action(chosen_action);
-                    }
-                    source.choose_action(
-                        DndAction::unwrap_single(&DndAction::vec_from_wl(chosen_action))
-                            .expect("We have selected a single value at this point."),
-                    );
+                if chosen != state.chosen_action {
+                    state.chosen_action = chosen;
+                    offer.action(chosen);
+                    source.choose_action(DndAction::unwrap_single(&DndAction::vec_from_wl(chosen)).unwrap());
                 }
-            } else if data.finished {
-                offer.post_error(
-                    wl_data_offer::Error::InvalidFinish,
-                    "SetActions request after Finish.",
-                );
             }
         }
         _ => unreachable!(),
@@ -412,7 +448,11 @@ impl<S: Source> OfferData for WlOfferData<S> {
             .wl_offers
             .iter()
             .any(|o| o.version() >= wl_data_offer::REQ_SET_ACTIONS_SINCE);
-        data.accepted && (!requires_action || !data.chosen_action.is_empty())
+        data.active
+            && self.source.alive()
+            && self.wl_offers.iter().any(Resource::is_alive)
+            && ((!requires_action && data.chosen_action == WlDndAction::Copy)
+                || (requires_action && data.accepted && !data.chosen_action.is_empty()))
     }
 }
 
@@ -437,7 +477,7 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
         let offer_state = Arc::new(Mutex::new(WlOfferState {
             active: true,
             dropped: false,
-            accepted: true,
+            accepted: false,
             finished: false,
             chosen_action: WlDndAction::empty(),
         }));
@@ -465,6 +505,8 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
                         WlDataOffer::interface(),
                         device.version(),
                         Arc::new(WlDndDataOffer {
+                            serial: *serial,
+                            version: device.version(),
                             state: offer_state.clone(),
                             source: Mutex::new(Some(source.clone())),
                         }),
@@ -487,6 +529,13 @@ impl<D: SeatHandler + DataDeviceHandler + 'static> DndFocus<D> for WlSurface {
                 offers.push(offer);
             }
 
+            if !offers.is_empty()
+                && offers.iter().all(|offer| offer.version() < 3)
+                && metadata.dnd_actions.contains(&DndAction::Copy)
+            {
+                offer_state.lock().unwrap().chosen_action = WlDndAction::Copy;
+                source.choose_action(DndAction::Copy);
+            }
             Some(WlOfferData {
                 state: offer_state,
                 source,
