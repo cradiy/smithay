@@ -186,7 +186,7 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _resource: &WpCommitTimingManagerV1,
+        resource: &WpCommitTimingManagerV1,
         request: wp_commit_timing_manager_v1::Request,
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
@@ -203,7 +203,7 @@ where
 
                 // The protocol mandates that only a single commit timer object is associated with a surface at all times
                 if has_active_commit_timer {
-                    surface.post_error(
+                    resource.post_error(
                         wp_commit_timing_manager_v1::Error::CommitTimerExists,
                         "the surface has already a commit timer object associated",
                     );
@@ -284,12 +284,17 @@ where
                     return;
                 };
 
+                if tv_nsec >= 1_000_000_000 {
+                    resource.post_error(
+                        wp_commit_timer_v1::Error::InvalidTimestamp,
+                        "timestamp nanoseconds must be less than one second",
+                    );
+                    return;
+                }
+
                 let tv_sec = ((tv_sec_hi as u64) << 32) | tv_sec_lo as u64;
 
-                let timestamp = Timestamp(Timespec {
-                    tv_sec: tv_sec as rustix::time::Secs,
-                    tv_nsec: tv_nsec as rustix::time::Nsecs,
-                });
+                let timestamp = Timestamp(std::time::Duration::new(tv_sec, tv_nsec));
 
                 let already_has_timestamp = with_states(&surface, move |states| {
                     let mut commit_timer_state = states
@@ -330,21 +335,12 @@ where
 }
 
 /// Timestamp set through [`wp_commit_timer_v1::Request::SetTimestamp`] for a surface
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
-pub struct Timestamp(Timespec);
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone)]
+pub struct Timestamp(std::time::Duration);
 
-impl Ord for Timestamp {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.0.tv_sec.cmp(&other.0.tv_sec) {
-            std::cmp::Ordering::Equal => self.0.tv_nsec.cmp(&other.0.tv_nsec),
-            other => other,
-        }
-    }
-}
-
-impl PartialOrd for Timestamp {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
+impl From<Timestamp> for std::time::Duration {
+    fn from(value: Timestamp) -> Self {
+        value.0
     }
 }
 
@@ -369,13 +365,20 @@ pub struct CommitTimerBarrierState {
 
 impl<Kind> From<Time<Kind>> for Timestamp {
     fn from(value: Time<Kind>) -> Self {
-        Self(value.into())
+        let value: Timespec = value.into();
+        Self(std::time::Duration::new(
+            value.tv_sec as u64,
+            value.tv_nsec as u32,
+        ))
     }
 }
 
 impl<Kind> From<Timestamp> for Time<Kind> {
     fn from(value: Timestamp) -> Self {
-        Time::from(value.0)
+        Time::from(Timespec {
+            tv_sec: value.0.as_secs() as rustix::time::Secs,
+            tv_nsec: value.0.subsec_nanos() as rustix::time::Nsecs,
+        })
     }
 }
 
@@ -437,5 +440,29 @@ impl std::cmp::PartialOrd for CommitTimerBarrier {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsigned_wire_deadlines_do_not_release_far_future_barriers_before_near_ones() {
+        let mut timers = CommitTimerBarrierState::default();
+        let distant = Timestamp(std::time::Duration::new(u64::MAX, 999_999_999));
+        let distant_barrier = timers.register(distant);
+        let near = Timestamp(std::time::Duration::from_secs(10));
+        let near_barrier = timers.register(near);
+        assert!(timers.signal_until(near));
+        assert!(near_barrier.is_signaled());
+        assert!(!distant_barrier.is_signaled());
+        assert_eq!(timers.next_deadline(), Some(distant));
+        assert_eq!(
+            std::time::Duration::from(distant),
+            std::time::Duration::new(u64::MAX, 999_999_999)
+        );
+        assert!(timers.signal_until(distant));
+        assert!(distant_barrier.is_signaled());
     }
 }
