@@ -86,7 +86,8 @@ use wayland_protocols::xdg::dialog::v1::server::{
     xdg_wm_dialog_v1::{self, XdgWmDialogV1},
 };
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, backend::GlobalId,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
+    backend::{ClientId, GlobalId},
     protocol::wl_surface::WlSurface,
 };
 
@@ -182,7 +183,7 @@ where
                 *dialog_guard = Some(toplevel_dialog);
                 drop(dialog_guard);
 
-                if set_dialog_hint(toplevel.wl_surface(), ToplevelDialogHint::Dialog) {
+                if toplevel.alive() && set_dialog_hint(toplevel.wl_surface(), ToplevelDialogHint::Dialog) {
                     state.dialog_hint_changed(toplevel, ToplevelDialogHint::Dialog);
                 }
             }
@@ -201,7 +202,7 @@ impl<D: XdgDialogHandler> Dispatch2<XdgDialogV1, D> for ToplevelSurface {
         &self,
         state: &mut D,
         _: &Client,
-        _: &XdgDialogV1,
+        resource: &XdgDialogV1,
         request: xdg_dialog_v1::Request,
         _dh: &DisplayHandle,
         _: &mut DataInit<'_, D>,
@@ -210,29 +211,38 @@ impl<D: XdgDialogHandler> Dispatch2<XdgDialogV1, D> for ToplevelSurface {
 
         match request {
             Request::SetModal => {
-                if set_dialog_hint(self.wl_surface(), ToplevelDialogHint::Modal) {
+                if self.alive() && set_dialog_hint(self.wl_surface(), ToplevelDialogHint::Modal) {
                     state.dialog_hint_changed(self.clone(), ToplevelDialogHint::Modal);
                 }
             }
 
             Request::UnsetModal => {
-                if set_dialog_hint(self.wl_surface(), ToplevelDialogHint::Dialog) {
+                if self.alive() && set_dialog_hint(self.wl_surface(), ToplevelDialogHint::Dialog) {
                     state.dialog_hint_changed(self.clone(), ToplevelDialogHint::Dialog);
                 }
             }
 
-            Request::Destroy => {
-                if set_dialog_hint(self.wl_surface(), ToplevelDialogHint::Unknown) {
-                    state.dialog_hint_changed(self.clone(), ToplevelDialogHint::Unknown);
-                }
-
-                if let Some(data) = self.xdg_toplevel().data::<XdgShellSurfaceUserData>() {
-                    data.dialog.lock().unwrap().take();
-                }
-            }
+            Request::Destroy => destroy_dialog(state, self, resource),
 
             _ => unreachable!(),
         }
+    }
+
+    fn destroyed(&self, state: &mut D, _: ClientId, resource: &XdgDialogV1) {
+        destroy_dialog(state, self, resource);
+    }
+}
+
+fn destroy_dialog<D: XdgDialogHandler>(state: &mut D, toplevel: &ToplevelSurface, resource: &XdgDialogV1) {
+    let data = toplevel.xdg_toplevel().data::<XdgShellSurfaceUserData>().unwrap();
+    let mut dialog = data.dialog.lock().unwrap();
+    if dialog.as_ref() != Some(resource) {
+        return;
+    }
+    dialog.take();
+    drop(dialog);
+    if toplevel.alive() && set_dialog_hint(toplevel.wl_surface(), ToplevelDialogHint::Unknown) {
+        state.dialog_hint_changed(toplevel.clone(), ToplevelDialogHint::Unknown);
     }
 }
 

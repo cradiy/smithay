@@ -185,6 +185,7 @@ where
     fn destroyed(&self, state: &mut D, _client_id: ClientId, xdg_toplevel: &XdgToplevel) {
         self.alive_tracker.destroy_notify();
         self.decoration.lock().unwrap().take();
+        self.dialog.lock().unwrap().take();
 
         if let Some(index) = state
             .xdg_shell_state()
