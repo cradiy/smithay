@@ -37,11 +37,41 @@ use tracing::{debug, info, info_span, instrument, trace, warn};
 
 use super::{PlaneConfig, PlaneState, VrrSupport};
 
+#[derive(Debug)]
+struct ModeBlob {
+    fd: DrmDeviceFd,
+    value: property::Value<'static>,
+}
+
+impl ModeBlob {
+    fn new(fd: &DrmDeviceFd, mode: &Mode) -> Result<Arc<Self>, Error> {
+        let value = fd.create_property_blob(mode).map_err(|source| {
+            Error::Access(AccessError {
+                errmsg: "Failed to create Property Blob for mode",
+                dev: fd.dev_path(),
+                source,
+            })
+        })?;
+        Ok(Arc::new(Self {
+            fd: fd.clone(),
+            value,
+        }))
+    }
+}
+
+impl Drop for ModeBlob {
+    fn drop(&mut self) {
+        if let Err(err) = self.fd.destroy_property_blob(self.value.into()) {
+            warn!("Unable to destroy mode blob: {}", err);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct State {
     pub active: bool,
     pub mode: Mode,
-    pub blob: property::Value<'static>,
+    blob: Option<Arc<ModeBlob>>,
     pub vrr: bool,
     pub connectors: HashSet<connector::Handle>,
 }
@@ -75,17 +105,6 @@ impl State {
         // we need to be sure, we require a mode to always be set without relying on the compiler.
         // So we cheat, because it works and is easier to handle later.
         let current_mode = crtc_info.mode().unwrap_or_else(|| unsafe { std::mem::zeroed() });
-        let current_blob = match crtc_info.mode() {
-            Some(mode) => fd.create_property_blob(&mode).map_err(|source| {
-                Error::Access(AccessError {
-                    errmsg: "Failed to create Property Blob for mode",
-                    dev: fd.dev_path(),
-                    source,
-                })
-            })?,
-            None => property::Value::Unknown(0),
-        };
-
         let res_handles = fd.resource_handles().map_err(|source| {
             Error::Access(AccessError {
                 errmsg: "Error loading drm resources",
@@ -146,7 +165,8 @@ impl State {
             // This is highly unlikely, but having a false negative should do no harm.
             active: active.unwrap_or(false),
             mode: current_mode,
-            blob: current_blob,
+            // Observing the existing kernel mode does not acquire a user blob.
+            blob: None,
             // If we don't know the VRR state, the driver doesn't support the property
             vrr: vrr.unwrap_or(false),
             connectors: current_connectors,
@@ -155,10 +175,16 @@ impl State {
 
     fn clear(&mut self) {
         self.mode = unsafe { std::mem::zeroed() };
-        self.blob = property::Value::Unknown(0);
+        self.blob = None;
         self.connectors.clear();
         self.active = false;
         self.vrr = false;
+    }
+
+    fn blob(&self) -> property::Value<'static> {
+        self.blob
+            .as_ref()
+            .map_or(property::Value::Unknown(0), |blob| blob.value)
     }
 }
 
@@ -194,13 +220,7 @@ impl AtomicDrmSurface {
         );
 
         let state = State::current_state(&*fd, crtc, &mut prop_mapping.write().unwrap())?;
-        let blob = fd.create_property_blob(&mode).map_err(|source| {
-            Error::Access(AccessError {
-                errmsg: "Failed to create Property Blob for mode",
-                dev: fd.dev_path(),
-                source,
-            })
-        })?;
+        let blob = Some(ModeBlob::new(fd.device_fd(), &mode)?);
         let pending = State {
             active: true,
             mode,
@@ -360,7 +380,7 @@ impl AtomicDrmSurface {
             let req = AtomicRequest::build_request(
                 &prop_mapping,
                 self.crtc,
-                Some(pending.blob),
+                Some(pending.blob()),
                 pending.vrr,
                 &connectors,
                 [],
@@ -419,7 +439,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            Some(pending.blob()),
             pending.vrr,
             &connectors,
             [&conn],
@@ -476,7 +496,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            Some(pending.blob()),
             pending.vrr,
             &conns,
             removed,
@@ -504,13 +524,7 @@ impl AtomicDrmSurface {
         let mut pending = self.pending.write().unwrap();
 
         // check if new config is supported
-        let new_blob = self.fd.create_property_blob(&mode).map_err(|source| {
-            Error::Access(AccessError {
-                errmsg: "Failed to create Property Blob for mode",
-                dev: self.fd.dev_path(),
-                source,
-            })
-        })?;
+        let new_blob = ModeBlob::new(self.fd.device_fd(), &mode)?;
 
         let test_buffer = self.create_test_buffer(mode.size(), self.plane)?;
 
@@ -530,27 +544,22 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(new_blob),
+            Some(new_blob.value),
             pending.vrr,
             pending.connectors.iter(),
             [],
             [&plane_state],
         )?;
-        if let Err(err) = self
-            .fd
+        self.fd
             .atomic_commit(
                 AtomicCommitFlags::ALLOW_MODESET | AtomicCommitFlags::TEST_ONLY,
                 req.build()?,
             )
-            .map_err(|_| Error::TestFailed(self.crtc))
-        {
-            let _ = self.fd.destroy_property_blob(new_blob.into());
-            return Err(err);
-        }
+            .map_err(|_| Error::TestFailed(self.crtc))?;
 
         // seems to be, lets change the mode
         pending.mode = mode;
-        pending.blob = new_blob;
+        pending.blob = Some(new_blob);
 
         Ok(())
     }
@@ -653,7 +662,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            Some(pending.blob()),
             value,
             &pending.connectors,
             &[],
@@ -723,7 +732,7 @@ impl AtomicDrmSurface {
         let req = AtomicRequest::build_request(
             &prop_mapping,
             self.crtc,
-            Some(pending.blob),
+            Some(pending.blob()),
             pending.vrr,
             &pending_conns,
             removed,
@@ -795,7 +804,7 @@ impl AtomicDrmSurface {
             let req = AtomicRequest::build_request(
                 &prop_mapping,
                 self.crtc,
-                Some(pending.blob),
+                Some(pending.blob()),
                 pending.vrr,
                 &pending_conns,
                 removed,
@@ -810,12 +819,6 @@ impl AtomicDrmSurface {
 
                 return Err(Error::TestFailed(self.crtc));
             } else {
-                if current.mode != pending.mode {
-                    if let Err(err) = self.fd.destroy_property_blob(current.blob.into()) {
-                        warn!("Failed to destroy old mode property blob: {}", err);
-                    }
-                }
-
                 // new config
                 req
             }
@@ -1011,16 +1014,7 @@ impl AtomicDrmSurface {
 
         // Re-initialize the mode blob which might got lost after suspend/resume
         let mut pending = self.pending.write().unwrap();
-        let blob = self.fd.create_property_blob(&pending.mode).map_err(|source| {
-            Error::Access(AccessError {
-                errmsg: "Failed to create Property Blob for mode",
-                dev: self.fd.dev_path(),
-                source,
-            })
-        })?;
-
-        let old_blob = std::mem::replace(&mut pending.blob, blob);
-        let _ = self.fd.destroy_property_blob(old_blob.into());
+        pending.blob = Some(ModeBlob::new(self.fd.device_fd(), &pending.mode)?);
 
         Ok(())
     }
@@ -1055,17 +1049,18 @@ impl Drop for TestBuffer {
 
 impl Drop for AtomicDrmSurface {
     fn drop(&mut self) {
-        if !self.active.load(Ordering::SeqCst) {
-            // the device is gone or we are on another tty
-            // old state has been restored, we shouldn't touch it.
-            // if we are on another tty the connectors will get disabled
-            // by the device, when switching back
-            return;
-        }
-
         let _guard = self.span.enter();
-        if let Err(err) = self.clear_state() {
-            warn!("Unable to clear state: {}", err);
+        if self.active.load(Ordering::SeqCst) {
+            let current = self.state.get_mut().unwrap();
+            let needs_clear = current.active
+                || current.mode.size() != (0, 0)
+                || !current.connectors.is_empty()
+                || !self.used_planes.get_mut().unwrap().is_empty();
+            if needs_clear {
+                if let Err(err) = self.clear_state() {
+                    warn!("Unable to clear state: {}", err);
+                }
+            }
         }
     }
 }

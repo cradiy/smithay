@@ -179,6 +179,20 @@ impl DrmDevice {
     ///
     /// Returns an error if the file is no valid drm node or the device is not accessible.
     pub fn new(fd: DrmDeviceFd, disable_connectors: bool) -> Result<(Self, DrmDeviceNotifier), Error> {
+        Self::new_internal(fd, disable_connectors, false)
+    }
+
+    /// Create an atomic-only device. Failure to enable atomic KMS is returned
+    /// without selecting legacy modesetting. SMITHAY_USE_LEGACY does not apply.
+    pub fn new_atomic(fd: DrmDeviceFd, disable_connectors: bool) -> Result<(Self, DrmDeviceNotifier), Error> {
+        Self::new_internal(fd, disable_connectors, true)
+    }
+
+    fn new_internal(
+        fd: DrmDeviceFd,
+        disable_connectors: bool,
+        atomic_only: bool,
+    ) -> Result<(Self, DrmDeviceNotifier), Error> {
         // setup parent span for internal device types
         let span = debug_span!(
             "drm_device",
@@ -213,7 +227,12 @@ impl DrmDevice {
             })
         })?;
 
-        let internal = Arc::new(DrmDevice::create_internal(fd, active, disable_connectors)?);
+        let internal = Arc::new(DrmDevice::create_internal(
+            fd,
+            active,
+            disable_connectors,
+            atomic_only,
+        )?);
 
         Ok((
             DrmDevice {
@@ -237,7 +256,23 @@ impl DrmDevice {
         fd: DrmDeviceFd,
         active: Arc<AtomicBool>,
         disable_connectors: bool,
+        atomic_only: bool,
     ) -> Result<DrmDeviceInternal, Error> {
+        if atomic_only {
+            fd.set_client_capability(ClientCapability::Atomic, true)
+                .map_err(|source| {
+                    Error::Access(AccessError {
+                        errmsg: "Error enabling required atomic modesetting",
+                        dev: fd.dev_path(),
+                        source,
+                    })
+                })?;
+            return Ok(DrmDeviceInternal::Atomic(AtomicDrmDevice::new(
+                fd,
+                active,
+                disable_connectors,
+            )?));
+        }
         let force_legacy = std::env::var("SMITHAY_USE_LEGACY")
             .map(|x| {
                 x == "1" || x.to_lowercase() == "true" || x.to_lowercase() == "yes" || x.to_lowercase() == "y"

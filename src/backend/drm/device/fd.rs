@@ -1,5 +1,6 @@
 use drm::{Device as BasicDevice, control::Device as ControlDevice};
 use std::{
+    io,
     os::unix::io::{AsFd, AsRawFd, BorrowedFd, RawFd},
     sync::{Arc, Weak},
 };
@@ -57,6 +58,19 @@ impl AsRawFd for DrmDeviceFd {
 }
 
 impl DrmDeviceFd {
+    /// Acquire DRM master and return an error if the device cannot be owned.
+    /// The returned handle releases master on its final drop. Clone that handle
+    /// instead of acquiring a second owner for the same open file description.
+    pub fn new_master(fd: DeviceFd) -> io::Result<Self> {
+        let mut device = InternalDrmDeviceFd {
+            fd,
+            privileged: false,
+        };
+        device.acquire_master_lock()?;
+        device.privileged = true;
+        Ok(Self(Arc::new(device)))
+    }
+
     /// Create a new `DrmDeviceFd`.
     ///
     /// This function will try to acquire the master lock for the underlying drm device

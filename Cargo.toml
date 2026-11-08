@@ -90,6 +90,10 @@ gl_generator = { version = "0.14", optional = true }
 pkg-config = { version = "0.3.17", optional = true }
 cc = { version = "1.0.79", optional = true }
 
+[[test]]
+name = "kms_device"
+required-features = ["backend_drm"]
+
 [features]
 default = ["backend_drm", "backend_gbm", "backend_libinput", "backend_udev", "backend_session_libseat", "backend_x11", "backend_winit", "desktop", "renderer_gl", "renderer_pixman", "renderer_multi", "xwayland", "wayland_frontend", "backend_vulkan", "backend_libei"]
 backend_winit = ["backend_winit_wayland", "winit/x11"]
