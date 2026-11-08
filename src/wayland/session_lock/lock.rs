@@ -12,6 +12,7 @@ use wayland_server::protocol::wl_output::WlOutput;
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, Resource};
 
 use crate::wayland::Dispatch2;
+use crate::wayland::output::OutputUserData;
 use crate::wayland::session_lock::surface::{ExtLockSurfaceUserData, LockSurface, LockSurfaceAttributes};
 use crate::wayland::session_lock::{LockStatus, SessionLockHandler};
 
@@ -57,9 +58,16 @@ where
                     return;
                 }
 
-                // Ensure output is not already locked.
+                // A client can bind one logical output through several resources.
+                // Compare weak identities so retired outputs remain independent.
                 let mut locked_outputs = self.locked_outputs.lock().unwrap();
-                if locked_outputs.contains(&output) {
+                if locked_outputs.iter().any(|existing| {
+                    existing == &output
+                        || existing
+                            .data::<OutputUserData>()
+                            .zip(output.data::<OutputUserData>())
+                            .is_some_and(|(existing, requested)| existing.output == requested.output)
+                }) {
                     lock.post_error(Error::DuplicateOutput, "Output is already locked.");
                     return;
                 }
