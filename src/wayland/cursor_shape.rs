@@ -110,9 +110,11 @@
 //! smithay::delegate_dispatch2!(State);
 //! ```
 
-use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Request as ShapeRequest;
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::Shape;
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::WpCursorShapeDeviceV1 as CursorShapeDevice;
+use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_device_v1::{
+    Error as ShapeError, Request as ShapeRequest,
+};
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::Request as ManagerRequest;
 use wayland_protocols::wp::cursor_shape::v1::server::wp_cursor_shape_manager_v1::WpCursorShapeManagerV1 as CursorShapeManager;
 use wayland_protocols::wp::tablet::zv2::server::zwp_tablet_tool_v2::ZwpTabletToolV2;
@@ -263,10 +265,24 @@ where
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
         match request {
-            ShapeRequest::SetShape {
-                serial,
-                shape: WEnum::Value(shape),
-            } => {
+            ShapeRequest::SetShape { serial, shape } => {
+                let shape = match shape {
+                    WEnum::Value(shape)
+                        if resource.version() >= 2 || !matches!(shape, Shape::DndAsk | Shape::AllResize) =>
+                    {
+                        shape
+                    }
+                    invalid => {
+                        resource.post_error(
+                            ShapeError::InvalidShape,
+                            format!(
+                                "invalid cursor shape {invalid:?} for cursor-shape version {}",
+                                resource.version()
+                            ),
+                        );
+                        return;
+                    }
+                };
                 match &self.0 {
                     CursorShapeDeviceUserDataInner::Pointer { seat } => {
                         let Some(seat) = seat.upgrade() else {
@@ -309,9 +325,6 @@ where
                             .tablet_tool_image(&handle.arc.descriptor, CursorImageStatus::Named(cursor_icon));
                     }
                 }
-            }
-            ShapeRequest::SetShape { .. } => {
-                // Ignore unknown shapes.
             }
             ShapeRequest::Destroy => {}
             _ => unreachable!(),
