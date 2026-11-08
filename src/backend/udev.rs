@@ -44,7 +44,7 @@ use rustix::fs::stat;
 use std::ops::{Deref, DerefMut};
 use std::{
     collections::HashMap,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fmt, io,
     os::unix::io::{AsFd, BorrowedFd},
     path::{Path, PathBuf},
@@ -61,6 +61,7 @@ use tracing::{debug, debug_span, info, warn};
 /// given handler of any changes. Can be used to provide hot-plug functionality for gpus and
 /// attached monitors.
 pub struct UdevBackend {
+    seat: String,
     devices: UdevDevices,
     monitor: MonitorSocket,
     token: Option<Token>,
@@ -72,6 +73,7 @@ impl fmt::Debug for UdevBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use udev::AsRaw;
         f.debug_struct("UdevBackend")
+            .field("seat", &self.seat)
             .field("devices", &self.devices)
             .field("monitor", &format!("MonitorSocket ({:?})", self.monitor.as_raw()))
             .finish()
@@ -94,6 +96,9 @@ impl UdevBackend {
         let span = debug_span!("backend_udev", seat = seat.to_string());
         let _guard = span.enter();
 
+        // Queue events before taking the initial snapshot so changes during
+        // enumeration are reconciled when the source starts dispatching.
+        let monitor = MonitorBuilder::new()?.match_subsystem("drm")?.listen()?;
         let devices = all_gpus(seat)?
             .into_iter()
             // Create devices
@@ -107,10 +112,9 @@ impl UdevBackend {
             .collect();
         let devices = UdevDevices(devices);
 
-        let monitor = MonitorBuilder::new()?.match_subsystem("drm")?.listen()?;
-
         drop(_guard);
         Ok(UdevBackend {
+            seat: seat.to_owned(),
             devices,
             monitor,
             token: None,
@@ -155,41 +159,15 @@ impl EventSource for UdevBackend {
                 event.devnum(),
                 event.devnode()
             );
-            match event.event_type() {
-                // New device
-                EventType::Add => {
-                    if let (Some(path), Some(devnum)) = (event.devnode(), event.devnum()) {
-                        info!("New device: #{} at {}", devnum, path.display());
-                        if self.devices.insert(devnum, path.to_path_buf()).is_none() {
-                            callback(
-                                UdevEvent::Added {
-                                    device_id: devnum,
-                                    path: path.to_path_buf(),
-                                },
-                                &mut self.devices,
-                            );
-                        }
-                    }
+            if let Some(device_id) = event.devnum() {
+                let eligible = gpu_matches_seat(event.sysname(), event.property_value("ID_SEAT"), &self.seat);
+                if let Some(update) =
+                    self.devices
+                        .update(event.event_type(), device_id, event.devnode(), eligible)
+                {
+                    info!(?update, "DRM device update");
+                    callback(update, &mut self.devices);
                 }
-                // Device removed
-                EventType::Remove => {
-                    if let Some(devnum) = event.devnum() {
-                        info!("Device removed: #{}", devnum);
-                        if self.devices.remove(&devnum).is_some() {
-                            callback(UdevEvent::Removed { device_id: devnum }, &mut self.devices);
-                        }
-                    }
-                }
-                // New connector
-                EventType::Change => {
-                    if let Some(devnum) = event.devnum() {
-                        info!("Device changed: #{}", devnum);
-                        if self.devices.contains_key(&devnum) {
-                            callback(UdevEvent::Changed { device_id: devnum }, &mut self.devices);
-                        }
-                    }
-                }
-                _ => {}
             }
         }
         Ok(PostAction::Continue)
@@ -217,6 +195,34 @@ impl EventSource for UdevBackend {
 pub struct UdevDevices(HashMap<dev_t, PathBuf>);
 
 impl UdevDevices {
+    fn update(
+        &mut self,
+        event: EventType,
+        device_id: dev_t,
+        path: Option<&Path>,
+        eligible: bool,
+    ) -> Option<UdevEvent> {
+        match event {
+            EventType::Remove | EventType::Change if !eligible || event == EventType::Remove => self
+                .0
+                .remove(&device_id)
+                .map(|_| UdevEvent::Removed { device_id }),
+            EventType::Add | EventType::Change if eligible => {
+                if let Some(known) = self.0.get_mut(&device_id) {
+                    if let Some(path) = path {
+                        *known = path.to_path_buf();
+                    }
+                    (event == EventType::Change).then_some(UdevEvent::Changed { device_id })
+                } else {
+                    let path = path?.to_path_buf();
+                    self.0.insert(device_id, path.clone());
+                    Some(UdevEvent::Added { device_id, path })
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Get a list of DRM devices currently known to the backend
     ///
     /// You should call this once before inserting the event source into your
@@ -331,16 +337,21 @@ fn gpus_for_seat<S: AsRef<str>>(seat: S) -> io::Result<Vec<Device>> {
     enumerator.match_sysname("card[0-9]*")?;
     let gpus = enumerator
         .scan_devices()?
-        .filter(|device| {
-            device
-                .property_value("ID_SEAT")
-                .map(|x| x.to_os_string())
-                .unwrap_or_else(|| OsString::from("seat0"))
-                == *seat.as_ref()
-        })
+        .filter(|device| gpu_matches_seat(device.sysname(), device.property_value("ID_SEAT"), seat.as_ref()))
         .collect::<Vec<_>>();
     Ok(gpus)
 }
+
+fn gpu_matches_seat(sysname: &OsStr, assigned: Option<&OsStr>, seat: &str) -> bool {
+    sysname
+        .as_encoded_bytes()
+        .strip_prefix(b"card")
+        .is_some_and(|number| !number.is_empty() && number.iter().all(u8::is_ascii_digit))
+        && assigned.unwrap_or_else(|| OsStr::new("seat0")) == OsStr::new(seat)
+}
+
+#[cfg(test)]
+mod tests;
 
 /// Returns the loaded driver for a device named by it's [`dev_t`].
 pub fn driver(dev: dev_t) -> io::Result<Option<OsString>> {
