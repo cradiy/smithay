@@ -97,7 +97,7 @@ use wayland_protocols::ext::image_copy_capture::v1::server::{
     ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1},
 };
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, Weak,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
     backend::GlobalId,
     protocol::{wl_buffer::WlBuffer, wl_pointer::WlPointer, wl_shm},
 };
@@ -208,6 +208,7 @@ fn validate_dmabuf(buffer: &WlBuffer, constraints: &BufferConstraints) -> Result
 /// Inner state for a capture session.
 #[derive(Debug)]
 struct SessionInner {
+    resource_destroyed: bool,
     stopped: bool,
     constraints: Option<BufferConstraints>,
     draw_cursors: bool,
@@ -216,8 +217,27 @@ struct SessionInner {
 }
 
 impl SessionInner {
+    fn stop(&mut self, obj: &ExtImageCopyCaptureSessionV1) {
+        if self.stopped {
+            return;
+        }
+        if let Some(frame) = self.active_frame.as_ref() {
+            frame
+                .inner
+                .lock()
+                .unwrap()
+                .fail(&frame.obj, FailureReason::Stopped);
+        }
+        if !self.resource_destroyed && obj.is_alive() {
+            obj.stopped();
+        }
+        self.constraints.take();
+        self.stopped = true;
+    }
+
     fn new(source: ImageCaptureSource, draw_cursors: bool) -> Self {
         Self {
+            resource_destroyed: false,
             stopped: false,
             constraints: None,
             draw_cursors,
@@ -338,32 +358,18 @@ impl PartialEq<SessionRef> for Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let mut inner = self.0.inner.lock().unwrap();
-
-        if !self.0.obj.is_alive() || inner.stopped {
-            return;
+        if !inner.resource_destroyed && self.0.obj.is_alive() {
+            inner.stop(&self.0.obj);
         }
-
-        // Fail the active frame
-        if let Some(frame) = inner.active_frame.take() {
-            frame
-                .inner
-                .lock()
-                .unwrap()
-                .fail(&frame.obj, FailureReason::Stopped);
-        }
-
-        self.0.obj.stopped();
-        inner.constraints.take();
-        inner.stopped = true;
     }
 }
 
 impl Session {
     /// Explicitly stop this session.
     ///
-    /// This is equivalent to dropping the session.
+    /// Pending frames are stopped even after the client destroys the session resource.
     pub fn stop(self) {
-        drop(self);
+        self.0.inner.lock().unwrap().stop(&self.0.obj);
     }
 
     /// Get a cloneable reference to this session.
@@ -379,6 +385,7 @@ impl Session {
 /// Inner state for a cursor capture session.
 #[derive(Debug)]
 struct CursorSessionInner {
+    resource_destroyed: bool,
     session_obj: Option<ExtImageCopyCaptureSessionV1>,
     stopped: bool,
     constraints: Option<BufferConstraints>,
@@ -390,8 +397,27 @@ struct CursorSessionInner {
 }
 
 impl CursorSessionInner {
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        if let Some(obj) = self.session_obj.as_ref().filter(|obj| obj.is_alive()) {
+            obj.stopped();
+        }
+        if let Some(frame) = self.active_frame.as_ref() {
+            frame
+                .inner
+                .lock()
+                .unwrap()
+                .fail(&frame.obj, FailureReason::Stopped);
+        }
+        self.constraints.take();
+        self.stopped = true;
+    }
+
     fn new(source: ImageCaptureSource, pointer: WlPointer) -> Self {
         Self {
+            resource_destroyed: false,
             session_obj: None,
             stopped: false,
             constraints: None,
@@ -556,32 +582,16 @@ impl PartialEq<CursorSessionRef> for CursorSession {
 impl Drop for CursorSession {
     fn drop(&mut self) {
         let mut inner = self.0.inner.lock().unwrap();
-
-        if !self.0.obj.is_alive() || inner.stopped {
-            return;
+        if !inner.resource_destroyed && self.0.obj.is_alive() {
+            inner.stop();
         }
-
-        if let Some(session_obj) = inner.session_obj.as_ref() {
-            session_obj.stopped();
-        }
-        inner.constraints.take();
-
-        if let Some(frame) = inner.active_frame.take() {
-            frame
-                .inner
-                .lock()
-                .unwrap()
-                .fail(&frame.obj, FailureReason::Stopped);
-        }
-
-        inner.stopped = true;
     }
 }
 
 impl CursorSession {
     /// Explicitly stop this session.
     pub fn stop(self) {
-        drop(self);
+        self.0.inner.lock().unwrap().stop();
     }
 
     /// Get a cloneable reference to this session.
@@ -601,23 +611,19 @@ struct FrameInner {
     constraints: Option<BufferConstraints>,
     buffer: Option<WlBuffer>,
     damage: Vec<Rectangle<i32, BufferCoords>>,
-    /// Reference to parent session (stored for future use).
-    #[allow(dead_code)]
-    session_obj: Weak<ExtImageCopyCaptureSessionV1>,
     capture_requested: bool,
     failed: Option<FailureReason>,
     ready: bool,
 }
 
 impl FrameInner {
-    fn new(session_obj: ExtImageCopyCaptureSessionV1, constraints: Option<BufferConstraints>) -> Self {
+    fn new(constraints: Option<BufferConstraints>, stopped: bool) -> Self {
         Self {
             constraints,
             buffer: None,
             damage: Vec::new(),
-            session_obj: session_obj.downgrade(),
             capture_requested: false,
-            failed: None,
+            failed: stopped.then_some(FailureReason::Stopped),
             ready: false,
         }
     }
@@ -889,6 +895,13 @@ pub struct CursorSessionData {
 #[derive(Debug)]
 pub struct FrameData {
     inner: Arc<Mutex<FrameInner>>,
+    owner: FrameOwner,
+}
+
+#[derive(Debug)]
+enum FrameOwner {
+    Session(std::sync::Weak<Mutex<SessionInner>>),
+    Cursor(std::sync::Weak<Mutex<CursorSessionInner>>),
 }
 
 /// State of the image copy capture protocol.
@@ -945,8 +958,16 @@ impl ImageCopyCaptureState {
 
     /// Clean up dead sessions.
     pub fn cleanup(&mut self) {
-        self.sessions.retain(|s| s.alive());
-        self.cursor_sessions.retain(|s| s.alive());
+        // A parent destructor does not invalidate its existing frame. Retain
+        // enough session metadata to dispatch that frame until it is destroyed.
+        self.sessions
+            .retain(|s| s.obj.is_alive() || s.inner.lock().unwrap().active_frame.is_some());
+        self.cursor_sessions.retain(|s| {
+            let inner = s.inner.lock().unwrap();
+            s.obj.is_alive()
+                || inner.session_obj.as_ref().is_some_and(Resource::is_alive)
+                || inner.active_frame.is_some()
+        });
     }
 }
 
@@ -982,7 +1003,7 @@ where
         &self,
         state: &mut D,
         _client: &Client,
-        _resource: &ExtImageCopyCaptureManagerV1,
+        resource: &ExtImageCopyCaptureManagerV1,
         request: ext_image_copy_capture_manager_v1::Request,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
@@ -993,9 +1014,19 @@ where
                 source,
                 options,
             } => {
+                let Some(options) = options.into_result().ok().filter(|options| {
+                    options.bits() & !ext_image_copy_capture_manager_v1::Options::all().bits() == 0
+                }) else {
+                    resource.post_error(
+                        ext_image_copy_capture_manager_v1::Error::InvalidOption,
+                        "unknown capture option flags",
+                    );
+                    return;
+                };
                 let Some(capture_source) = ImageCaptureSource::from_resource(&source) else {
                     // Invalid source - create stopped session
                     let inner = Arc::new(Mutex::new(SessionInner {
+                        resource_destroyed: false,
                         stopped: true,
                         constraints: None,
                         draw_cursors: false,
@@ -1014,10 +1045,7 @@ where
                     return;
                 };
 
-                let draw_cursors = options
-                    .into_result()
-                    .map(|o| o.contains(ext_image_copy_capture_manager_v1::Options::PaintCursors))
-                    .unwrap_or(false);
+                let draw_cursors = options.contains(ext_image_copy_capture_manager_v1::Options::PaintCursors);
                 let inner = Arc::new(Mutex::new(SessionInner::new(
                     capture_source.clone(),
                     draw_cursors,
@@ -1122,17 +1150,26 @@ where
     ) {
         match request {
             ext_image_copy_capture_session_v1::Request::CreateFrame { frame } => {
-                if self.inner.lock().unwrap().active_frame.is_some() {
+                let mut session = self.inner.lock().unwrap();
+                if session.active_frame.is_some() {
                     resource.post_error(
                         ext_image_copy_capture_session_v1::Error::DuplicateFrame,
                         "create_frame sent before the previous frame was destroyed",
                     );
                     return;
                 }
-                let constraints = self.inner.lock().unwrap().constraints.clone();
-                let inner = Arc::new(Mutex::new(FrameInner::new(resource.clone(), constraints)));
-                let obj = data_init.init(frame, FrameData { inner: inner.clone() });
-                self.inner.lock().unwrap().active_frame = Some(FrameRef { obj, inner });
+                let inner = Arc::new(Mutex::new(FrameInner::new(
+                    session.constraints.clone(),
+                    session.stopped,
+                )));
+                let obj = data_init.init(
+                    frame,
+                    FrameData {
+                        inner: inner.clone(),
+                        owner: FrameOwner::Session(Arc::downgrade(&self.inner)),
+                    },
+                );
+                session.active_frame = Some(FrameRef { obj, inner });
             }
             ext_image_copy_capture_session_v1::Request::Destroy => {}
             _ => unreachable!(),
@@ -1145,6 +1182,9 @@ where
         _client: wayland_server::backend::ClientId,
         resource: &ExtImageCopyCaptureSessionV1,
     ) {
+        // Resource destruction is distinct from an owner-requested stop: its
+        // existing frame remains valid even if the handler drops its Session.
+        self.inner.lock().unwrap().resource_destroyed = true;
         let session_ref = SessionRef {
             obj: resource.clone(),
             inner: self.inner.clone(),
@@ -1170,17 +1210,26 @@ where
     ) {
         match request {
             ext_image_copy_capture_session_v1::Request::CreateFrame { frame } => {
-                if self.inner.lock().unwrap().active_frame.is_some() {
+                let mut session = self.inner.lock().unwrap();
+                if session.active_frame.is_some() {
                     resource.post_error(
                         ext_image_copy_capture_session_v1::Error::DuplicateFrame,
                         "create_frame sent before the previous frame was destroyed",
                     );
                     return;
                 }
-                let constraints = self.inner.lock().unwrap().constraints.clone();
-                let inner = Arc::new(Mutex::new(FrameInner::new(resource.clone(), constraints)));
-                let obj = data_init.init(frame, FrameData { inner: inner.clone() });
-                self.inner.lock().unwrap().active_frame = Some(FrameRef { obj, inner });
+                let inner = Arc::new(Mutex::new(FrameInner::new(
+                    session.constraints.clone(),
+                    session.stopped,
+                )));
+                let obj = data_init.init(
+                    frame,
+                    FrameData {
+                        inner: inner.clone(),
+                        owner: FrameOwner::Cursor(Arc::downgrade(&self.inner)),
+                    },
+                );
+                session.active_frame = Some(FrameRef { obj, inner });
             }
             ext_image_copy_capture_session_v1::Request::Destroy => {}
             _ => unreachable!(),
@@ -1196,7 +1245,7 @@ where
         &self,
         _state: &mut D,
         _client: &Client,
-        _resource: &ExtImageCopyCaptureCursorSessionV1,
+        resource: &ExtImageCopyCaptureCursorSessionV1,
         request: ext_image_copy_capture_cursor_session_v1::Request,
         _dh: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
@@ -1206,7 +1255,10 @@ where
                 let mut inner = self.inner.lock().unwrap();
 
                 if inner.session_obj.is_some() {
-                    // Protocol error: only one session allowed
+                    resource.post_error(
+                        ext_image_copy_capture_cursor_session_v1::Error::DuplicateSession,
+                        "get_capture_session sent more than once",
+                    );
                     return;
                 }
 
@@ -1253,6 +1305,7 @@ where
         _client: wayland_server::backend::ClientId,
         resource: &ExtImageCopyCaptureCursorSessionV1,
     ) {
+        self.inner.lock().unwrap().resource_destroyed = true;
         let session_ref = CursorSessionRef {
             obj: resource.clone(),
             inner: self.inner.clone(),
@@ -1279,7 +1332,10 @@ where
             ext_image_copy_capture_frame_v1::Request::AttachBuffer { buffer } => {
                 let mut inner = self.inner.lock().unwrap();
                 if inner.capture_requested {
-                    // Protocol error: can't attach after capture
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::AlreadyCaptured,
+                        "attach_buffer sent after capture",
+                    );
                     return;
                 }
                 inner.buffer = Some(buffer);
@@ -1287,10 +1343,18 @@ where
             ext_image_copy_capture_frame_v1::Request::DamageBuffer { x, y, width, height } => {
                 let mut inner = self.inner.lock().unwrap();
                 if inner.capture_requested {
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::AlreadyCaptured,
+                        "damage_buffer sent after capture",
+                    );
                     return;
                 }
                 // Validate coordinates
                 if x < 0 || y < 0 || width <= 0 || height <= 0 {
+                    resource.post_error(
+                        ext_image_copy_capture_frame_v1::Error::InvalidBufferDamage,
+                        "buffer damage requires nonnegative coordinates and positive dimensions",
+                    );
                     return;
                 }
                 inner.damage.push(Rectangle {
@@ -1306,7 +1370,11 @@ where
 
                 {
                     let mut inner = self.inner.lock().unwrap();
-                    if inner.capture_requested || inner.failed.is_some() {
+                    if inner.capture_requested {
+                        resource.post_error(
+                            ext_image_copy_capture_frame_v1::Error::AlreadyCaptured,
+                            "capture sent more than once",
+                        );
                         return;
                     }
                     inner.capture_requested = true;
@@ -1314,10 +1382,17 @@ where
                     let buffer = match inner.buffer.as_ref() {
                         Some(b) => b,
                         None => {
-                            inner.fail(resource, FailureReason::BufferConstraints);
+                            resource.post_error(
+                                ext_image_copy_capture_frame_v1::Error::NoBuffer,
+                                "capture requires an attached buffer",
+                            );
                             return;
                         }
                     };
+                    if let Some(reason) = inner.failed {
+                        resource.failed(reason);
+                        return;
+                    }
 
                     match inner.constraints.as_ref() {
                         Some(constraints) => {
@@ -1386,22 +1461,28 @@ where
             inner: self.inner.clone(),
         };
 
-        // Remove the frame from whichever session holds it
-        for session in &state.image_copy_capture_state().sessions {
-            session
-                .inner
-                .lock()
-                .unwrap()
-                .active_frame
-                .take_if(|f| f == &frame_ref);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            // An asynchronous capture may still hold Frame after its protocol
+            // object is gone. Mark it failed without emitting a destructor event.
+            if !inner.ready && inner.failed.is_none() {
+                inner.failed = Some(FailureReason::Unknown);
+            }
         }
-        for session in &state.image_copy_capture_state().cursor_sessions {
-            session
-                .inner
-                .lock()
-                .unwrap()
-                .active_frame
-                .take_if(|f| f == &frame_ref);
+
+        // Rejected and stopped sessions need this cleanup too, even when
+        // they were never added to the active session lists.
+        match &self.owner {
+            FrameOwner::Session(owner) => {
+                if let Some(owner) = owner.upgrade() {
+                    owner.lock().unwrap().active_frame.take_if(|f| f == &frame_ref);
+                }
+            }
+            FrameOwner::Cursor(owner) => {
+                if let Some(owner) = owner.upgrade() {
+                    owner.lock().unwrap().active_frame.take_if(|f| f == &frame_ref);
+                }
+            }
         }
 
         state.frame_aborted(frame_ref);
