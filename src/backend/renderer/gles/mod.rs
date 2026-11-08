@@ -891,6 +891,24 @@ impl GlesRenderer {
         self.is_software
     }
 
+    /// Submit pending GLES work and return its completion fence.
+    ///
+    /// This also covers commands issued outside a render frame, such as image
+    /// readback. Without fence support, completion is synchronous, as with Frame::finish.
+    pub fn submit(&mut self) -> Result<SyncPoint, GlesError> {
+        // SAFETY: This renderer owns its EGL context and no frame can borrow it here.
+        unsafe {
+            self.egl.make_current()?;
+        }
+        if let Some(sync) = self.export_sync_point() {
+            return Ok(sync);
+        }
+        unsafe {
+            self.gl.Finish();
+        }
+        Ok(SyncPoint::signaled())
+    }
+
     fn export_sync_point(&self) -> Option<SyncPoint> {
         if self.capabilities.contains(&Capability::ExportFence) {
             if let Ok(fence) = EGLFence::create(self.egl.display()) {
