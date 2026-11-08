@@ -184,6 +184,8 @@
 //! ```
 
 mod dispatch;
+#[cfg(test)]
+mod tests;
 
 use std::{
     collections::HashMap,
@@ -563,6 +565,7 @@ impl SurfaceDmabufFeedbackState {
 #[derive(Debug)]
 struct DmabufGlobalState {
     id: GlobalId,
+    formats: Arc<Mutex<IndexMap<Fourcc, IndexSet<Modifier>>>>,
 
     default_feedback: Option<Arc<Mutex<DmabufFeedback>>>,
     known_default_feedbacks:
@@ -712,7 +715,7 @@ impl DmabufState {
                 },
             );
 
-        let formats = Arc::new(formats);
+        let formats = Arc::new(Mutex::new(formats));
         let version = if default_feedback.is_some() { 6 } else { 3 };
 
         let known_default_feedbacks = Arc::new(Mutex::new(Vec::new()));
@@ -720,7 +723,7 @@ impl DmabufState {
 
         let data = DmabufGlobalData {
             filter: Box::new(filter),
-            formats,
+            formats: formats.clone(),
             default_feedback: default_feedback.clone(),
             known_default_feedbacks: known_default_feedbacks.clone(),
             id,
@@ -731,6 +734,7 @@ impl DmabufState {
             id,
             DmabufGlobalState {
                 id: global,
+                formats,
                 default_feedback,
                 known_default_feedbacks,
             },
@@ -756,6 +760,16 @@ impl DmabufState {
         // No need to update if the feedback did not change
         if &*current_feedback == default_feedback {
             return;
+        }
+
+        // Existing managers and parameter objects share the accepted formats.
+        // Keep earlier advertisements valid while admitting newly advertised
+        // formats; the compositor still validates actual backend import support.
+        {
+            let mut formats = global.formats.lock().unwrap();
+            for format in default_feedback.main_formats() {
+                formats.entry(format.code).or_default().insert(format.modifier);
+            }
         }
 
         let known_default_feedbacks = global.known_default_feedbacks.lock().unwrap();
@@ -792,7 +806,7 @@ impl DmabufState {
 #[allow(missing_debug_implementations)]
 pub struct DmabufGlobalData {
     filter: Box<dyn for<'c> Fn(&'c Client) -> bool + Send + Sync>,
-    formats: Arc<IndexMap<Fourcc, IndexSet<Modifier>>>,
+    formats: Arc<Mutex<IndexMap<Fourcc, IndexSet<Modifier>>>>,
     default_feedback: Option<Arc<Mutex<DmabufFeedback>>>,
     known_default_feedbacks:
         Arc<Mutex<Vec<wayland_server::Weak<zwp_linux_dmabuf_feedback_v1::ZwpLinuxDmabufFeedbackV1>>>>,
@@ -802,7 +816,7 @@ pub struct DmabufGlobalData {
 /// Data associated with a dmabuf global protocol object.
 #[derive(Debug)]
 pub struct DmabufData {
-    formats: Arc<IndexMap<Fourcc, IndexSet<Modifier>>>,
+    formats: Arc<Mutex<IndexMap<Fourcc, IndexSet<Modifier>>>>,
     id: usize,
 
     default_feedback: Option<Arc<Mutex<DmabufFeedback>>>,
@@ -827,7 +841,7 @@ pub struct DmabufParamsData {
     /// Whether the params protocol object has been used before to create a wl_buffer.
     used: AtomicBool,
 
-    formats: Arc<IndexMap<Fourcc, IndexSet<Modifier>>>,
+    formats: Arc<Mutex<IndexMap<Fourcc, IndexSet<Modifier>>>>,
 
     /// Pending planes for the params.
     modifier: Mutex<Option<Modifier>>,
@@ -1093,7 +1107,7 @@ impl DmabufParamsData {
 
         // Validate buffer parameters:
         // 1. Must have known format
-        if !self.formats.contains_key(&format) {
+        if !self.formats.lock().unwrap().contains_key(&format) {
             params.post_error(
                 zwp_linux_buffer_params_v1::Error::InvalidFormat,
                 format!("Format {format:?}/{:x} is not supported.", format as u32),

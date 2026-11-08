@@ -198,7 +198,7 @@ where
         //
         // These events are deprecated in version 4 of the protocol.
         if zwp_dmabuf.version() < zwp_linux_dmabuf_v1::REQ_GET_DEFAULT_FEEDBACK_SINCE {
-            for (fourcc, modifiers) in &*self.formats {
+            for (fourcc, modifiers) in self.formats.lock().unwrap().iter() {
                 // Modifier support got added in version 3
                 if zwp_dmabuf.version() < zwp_linux_dmabuf_v1::EVT_MODIFIER_SINCE {
                     if modifiers.contains(&Modifier::Invalid) || modifiers.contains(&Modifier::Linear) {
