@@ -2041,6 +2041,14 @@ impl GlesRenderer {
         Ok(func(&self.gl))
     }
 
+    /// Wait for all previously submitted work in this renderer's context.
+    ///
+    /// This blocks the calling thread. Use it for teardown after a failure
+    /// without a completion fence; normal frames should use their sync points.
+    pub fn quiesce(&mut self) -> Result<(), GlesError> {
+        self.with_context(|gl| unsafe { gl.Finish() })
+    }
+
     /// Run custom code in the GL context with GPU profiling.
     ///
     /// Sets up a GPU profiling span, calls [`with_context()`](Self::with_context), then finishes
