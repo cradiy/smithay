@@ -666,19 +666,15 @@ impl<D: SeatHandler + 'static> TouchInternal<D> {
     }
 
     fn cancel(&mut self, data: &mut D, seat: &Seat<D>) {
-        let Some(marker) = self.pending_frame.take() else {
-            tracing::warn!("cancel called without prior events");
-            return;
-        };
+        // Cancellation terminates all contacts, including those in an already
+        // completed frame. It has its own marker when no frame is pending.
+        let marker = self.frame_marker();
+        self.pending_frame = None;
 
-        for state in self.focus.values_mut() {
-            if state.current.map(|c| c == state.pending).unwrap_or(false) {
-                continue;
-            }
-
-            state.current = Some(marker);
-
-            if let Some((focus, _)) = state.focus.take() {
+        for (_, state) in self.focus.drain() {
+            // An up event may already have been sent without its closing frame.
+            let focus = state.focus.map(|(focus, _)| focus).or(state.frame_pending);
+            if let Some(focus) = focus {
                 if focus.last_frame(seat, data) != Some(marker) {
                     focus.cancel(seat, data, marker);
                 }
