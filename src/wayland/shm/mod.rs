@@ -111,8 +111,11 @@ use wayland_server::{
     },
 };
 
+mod copy;
 mod handlers;
 mod pool;
+
+pub use copy::{BufferCopyError, copy_buffer_contents};
 
 use crate::{
     backend::allocator::format::get_bpp,
