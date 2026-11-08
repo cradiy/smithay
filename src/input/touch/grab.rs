@@ -231,9 +231,14 @@ impl<D: SeatHandler + 'static> TouchGrab<D> for TouchDownGrab<D> {
         &mut self,
         data: &mut D,
         handle: &mut TouchInnerHandle<'_, D>,
-        _focus: Option<(<D as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
+        focus: Option<(<D as SeatHandler>::TouchFocus, Point<f64, Logical>)>,
         event: &DownEvent,
     ) {
+        if let (Some((target, origin)), Some((current, updated))) = (&mut self.start_data.focus, focus) {
+            if *target == current {
+                *origin = updated;
+            }
+        }
         handle.down(data, self.start_data.focus.clone(), event);
         self.touch_points += 1;
     }

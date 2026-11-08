@@ -361,5 +361,21 @@ fn moved_target_origins_apply_to_motion_and_late_binding_replay() {
     );
     runtime.frame();
     wire.sync(&mut runtime);
-    assert_eq!(wire.probe.coordinates, [(0, 0, 3., 4.), (1, 0, 3., 4.)]);
+    assert_eq!(
+        std::mem::take(&mut wire.probe.coordinates),
+        [(0, 0, 3., 4.), (1, 0, 3., 4.)]
+    );
+    runtime.touch.clone().down(
+        &mut runtime.state,
+        Some((surface.clone(), (10., 20.).into())),
+        &DownEvent {
+            slot: Some(1).into(),
+            location: (15., 26.).into(),
+            serial: 201.into(),
+            time: InputTime::from_micros(3000),
+        },
+    );
+    runtime.frame();
+    wire.sync(&mut runtime);
+    assert_eq!(wire.probe.coordinates, [(0, 1, 5., 6.), (1, 1, 5., 6.)]);
 }
