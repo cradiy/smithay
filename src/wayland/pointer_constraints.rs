@@ -17,11 +17,12 @@ use wayland_protocols::wp::pointer_constraints::zv1::server::{
     zwp_pointer_constraints_v1::{self, Lifetime, ZwpPointerConstraintsV1},
 };
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend::GlobalId,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
+    backend::{GlobalId, ObjectId},
     protocol::wl_surface::WlSurface,
 };
 
-use super::compositor::{self, RegionAttributes};
+use super::compositor::{self, Cacheable, RegionAttributes};
 use crate::{
     input::{
         SeatHandler,
@@ -79,7 +80,6 @@ pub trait PointerConstraintsHandler: SeatHandler {
 pub struct ConfinedPointer {
     handle: zwp_confined_pointer_v1::ZwpConfinedPointerV1,
     region: Option<RegionAttributes>,
-    pending_region: Option<RegionAttributes>,
     lifetime: WEnum<Lifetime>,
     active: AtomicBool,
 }
@@ -96,10 +96,8 @@ impl ConfinedPointer {
 pub struct LockedPointer {
     handle: zwp_locked_pointer_v1::ZwpLockedPointerV1,
     region: Option<RegionAttributes>,
-    pending_region: Option<RegionAttributes>,
     lifetime: WEnum<Lifetime>,
     cursor_position_hint: Option<Point<f64, Logical>>,
-    pending_cursor_position_hint: Option<Point<f64, Logical>>,
     active: AtomicBool,
 }
 
@@ -217,18 +215,56 @@ impl PointerConstraint {
         }
     }
 
-    /// Commits the pending state of the constraint, and returns the cursor position hint if it has changed.
-    fn commit(&mut self) -> Option<Point<f64, Logical>> {
+    fn id(&self) -> ObjectId {
         match self {
-            Self::Confined(confined) => {
-                confined.region.clone_from(&confined.pending_region);
-                None
+            Self::Confined(confined) => confined.handle.id(),
+            Self::Locked(locked) => locked.handle.id(),
+        }
+    }
+
+    fn apply_pending(&mut self, pending: PendingConstraint) -> Option<Point<f64, Logical>> {
+        if let Some(region) = pending.region {
+            match self {
+                Self::Confined(confined) => confined.region = region,
+                Self::Locked(locked) => locked.region = region,
             }
-            Self::Locked(locked) => {
-                locked.region.clone_from(&locked.pending_region);
-                locked.pending_cursor_position_hint.take().inspect(|hint| {
-                    locked.cursor_position_hint = Some(*hint);
-                })
+        }
+        if let Self::Locked(locked) = self
+            && let Some(hint) = pending.cursor_position_hint
+        {
+            locked.cursor_position_hint = Some(hint);
+            return Some(hint);
+        }
+        None
+    }
+}
+
+#[derive(Debug, Default)]
+struct PendingConstraint {
+    region: Option<Option<RegionAttributes>>,
+    cursor_position_hint: Option<Point<f64, Logical>>,
+}
+
+#[derive(Debug, Default)]
+struct ConstraintCachedState {
+    changes: HashMap<ObjectId, PendingConstraint>,
+}
+
+impl Cacheable for ConstraintCachedState {
+    fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+        Self {
+            changes: std::mem::take(&mut self.changes),
+        }
+    }
+
+    fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+        for (id, pending) in self.changes {
+            let current = into.changes.entry(id).or_default();
+            if pending.region.is_some() {
+                current.region = pending.region;
+            }
+            if pending.cursor_position_hint.is_some() {
+                current.cursor_position_hint = pending.cursor_position_hint;
             }
         }
     }
@@ -304,11 +340,25 @@ fn commit_hook<D: SeatHandler + PointerConstraintsHandler + 'static>(
     //
     // This is to avoid deadlocks when the handler method might try to access the constraints again.
     // It's not a hypothetical, it bit me while implementing the position hint functionality.
+    let mut changes = compositor::with_states(surface, |states| {
+        std::mem::take(
+            &mut states
+                .cached_state
+                .get::<ConstraintCachedState>()
+                .current()
+                .changes,
+        )
+    });
     let position_hints = with_constraint_data::<D, _, _>(surface, |data| {
         let data = data.unwrap();
         data.constraints
             .iter_mut()
-            .filter_map(|(pointer, constraint)| constraint.commit().map(|hint| (pointer.clone(), hint)))
+            .filter_map(|(pointer, constraint)| {
+                changes
+                    .remove(&constraint.id())
+                    .and_then(|pending| constraint.apply_pending(pending))
+                    .map(|hint| (pointer.clone(), hint))
+            })
             .collect::<Vec<_>>()
     });
 
@@ -368,16 +418,31 @@ fn add_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
     }
 }
 
+fn retire_pending(surface: &WlSurface, object: ObjectId) {
+    compositor::with_states(surface, |states| {
+        if states.cached_state.has::<ConstraintCachedState>() {
+            states
+                .cached_state
+                .get::<ConstraintCachedState>()
+                .for_each_mut(|state| {
+                    state.changes.remove(&object);
+                });
+        }
+    });
+}
+
 fn remove_constraint<D: SeatHandler + PointerConstraintsHandler + 'static>(
     state: &mut D,
     surface: &WlSurface,
     pointer: &PointerHandle<D>,
+    object: ObjectId,
 ) {
     let is_removed = with_constraint_data::<D, _, _>(surface, |data| {
-        if let Some(data) = data {
-            if let Some(constraint) = data.constraints.remove(pointer) {
-                return Some(constraint);
-            }
+        if let Some(data) = data
+            && let hash_map::Entry::Occupied(entry) = data.constraints.entry(pointer.clone())
+            && entry.get().id() == object
+        {
+            return Some(entry.remove());
         }
         None
     });
@@ -429,11 +494,9 @@ where
                         &pointer,
                         PointerConstraint::Locked(LockedPointer {
                             handle,
-                            region: region.clone(),
-                            pending_region: region,
+                            region,
                             lifetime,
                             cursor_position_hint: None,
-                            pending_cursor_position_hint: None,
                             active: AtomicBool::new(false),
                         }),
                     );
@@ -464,8 +527,7 @@ where
                         &pointer,
                         PointerConstraint::Confined(ConfinedPointer {
                             handle,
-                            region: region.clone(),
-                            pending_region: region,
+                            region,
                             lifetime,
                             active: AtomicBool::new(false),
                         }),
@@ -505,23 +567,22 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _confined_pointer: &ZwpConfinedPointerV1,
+        confined_pointer: &ZwpConfinedPointerV1,
         request: zwp_confined_pointer_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
-            return;
-        };
-
         match request {
             zwp_confined_pointer_v1::Request::SetRegion { region } => {
-                with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Confined(confined)) =
-                        constraint.map(|x| x.entry.into_mut())
-                    {
-                        confined.pending_region = region.as_ref().map(compositor::get_region_attributes);
-                    }
+                compositor::with_states(&self.surface, |states| {
+                    states
+                        .cached_state
+                        .get::<ConstraintCachedState>()
+                        .pending()
+                        .changes
+                        .entry(confined_pointer.id())
+                        .or_default()
+                        .region = Some(region.as_ref().map(compositor::get_region_attributes));
                 });
             }
             zwp_confined_pointer_v1::Request::Destroy => {}
@@ -533,13 +594,14 @@ where
         &self,
         state: &mut D,
         _client: wayland_server::backend::ClientId,
-        _resource: &ZwpConfinedPointerV1,
+        resource: &ZwpConfinedPointerV1,
     ) {
+        retire_pending(&self.surface, resource.id());
         let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
             return;
         };
 
-        remove_constraint(state, &self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer, resource.id());
     }
 }
 
@@ -553,28 +615,34 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _locked_pointer: &ZwpLockedPointerV1,
+        locked_pointer: &ZwpLockedPointerV1,
         request: zwp_locked_pointer_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
-        let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
-            return;
-        };
-
         match request {
             zwp_locked_pointer_v1::Request::SetCursorPositionHint { surface_x, surface_y } => {
-                with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
-                        locked.pending_cursor_position_hint = Some((surface_x, surface_y).into());
-                    }
+                compositor::with_states(&self.surface, |states| {
+                    states
+                        .cached_state
+                        .get::<ConstraintCachedState>()
+                        .pending()
+                        .changes
+                        .entry(locked_pointer.id())
+                        .or_default()
+                        .cursor_position_hint = Some((surface_x, surface_y).into());
                 });
             }
             zwp_locked_pointer_v1::Request::SetRegion { region } => {
-                with_pointer_constraint(&self.surface, pointer, |constraint| {
-                    if let Some(PointerConstraint::Locked(locked)) = constraint.map(|x| x.entry.into_mut()) {
-                        locked.pending_region = region.as_ref().map(compositor::get_region_attributes);
-                    }
+                compositor::with_states(&self.surface, |states| {
+                    states
+                        .cached_state
+                        .get::<ConstraintCachedState>()
+                        .pending()
+                        .changes
+                        .entry(locked_pointer.id())
+                        .or_default()
+                        .region = Some(region.as_ref().map(compositor::get_region_attributes));
                 });
             }
             zwp_locked_pointer_v1::Request::Destroy => {}
@@ -586,12 +654,13 @@ where
         &self,
         state: &mut D,
         _client: wayland_server::backend::ClientId,
-        _resource: &ZwpLockedPointerV1,
+        resource: &ZwpLockedPointerV1,
     ) {
+        retire_pending(&self.surface, resource.id());
         let Some(pointer) = &self.arc.upgrade().map(|arc| PointerHandle { arc }) else {
             return;
         };
 
-        remove_constraint(state, &self.surface, pointer);
+        remove_constraint(state, &self.surface, pointer, resource.id());
     }
 }
