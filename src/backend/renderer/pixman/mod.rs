@@ -602,7 +602,7 @@ impl Frame for PixmanFrame<'_, '_> {
                 .map(has_alpha)
                 .unwrap_or(true);
 
-            let op = if has_alpha {
+            let op = if has_alpha || alpha != 1.0 {
                 Operation::Over
             } else {
                 Operation::Src
@@ -1364,6 +1364,47 @@ mod tests {
             image: Mutex::new(image),
             _flipped: false,
         }))
+    }
+
+    #[test]
+    fn texture_alpha_blends_over_existing_content_for_opaque_and_alpha_formats() {
+        let mut renderer = PixmanRenderer::new().unwrap();
+        let area = Rectangle::from_size((1, 1).into());
+        for (format, pixel, half, full) in [
+            (DrmFourcc::Xrgb8888, 0xffff0000u32, 0xff80007f, 0xffff0000),
+            (DrmFourcc::Argb8888, 0x80800000u32, 0xff4000bf, 0xff80007f),
+        ] {
+            let texture = renderer
+                .import_memory(&pixel.to_ne_bytes(), format, (1, 1).into(), false)
+                .unwrap();
+            for (alpha, expected) in [(0.0, 0xff0000ff), (128.0 / 255.0, half), (1.0, full)] {
+                let mut image = renderer
+                    .create_buffer(DrmFourcc::Argb8888, (1, 1).into())
+                    .unwrap();
+                let mut target = renderer.bind(&mut image).unwrap();
+                let mut frame = renderer
+                    .render(&mut target, (1, 1).into(), Transform::Normal)
+                    .unwrap();
+                frame.clear(Color32F::new(0.0, 0.0, 1.0, 1.0), &[area]).unwrap();
+                frame
+                    .render_texture_from_to(
+                        &texture,
+                        Rectangle::from_size((1.0, 1.0).into()),
+                        area,
+                        &[area],
+                        &[],
+                        Transform::Normal,
+                        alpha,
+                    )
+                    .unwrap();
+                frame.finish().unwrap().wait().unwrap();
+                let mapping = renderer
+                    .copy_framebuffer(&target, Rectangle::from_size((1, 1).into()), DrmFourcc::Argb8888)
+                    .unwrap();
+                let bytes = renderer.map_texture(&mapping).unwrap();
+                assert_eq!(u32::from_ne_bytes(bytes[..4].try_into().unwrap()), expected);
+            }
+        }
     }
 
     #[test]
