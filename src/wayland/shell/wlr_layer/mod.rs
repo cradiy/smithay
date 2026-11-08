@@ -95,6 +95,9 @@ pub struct LayerSurfaceAttributes {
     /// during the first commit a initial
     /// configure event is sent to the client
     pub initial_configure_sent: bool,
+    // In-flight configures from an earlier mapping may still be acknowledged,
+    // but only this handshake can authorize a new buffer.
+    initial_configure_serial: Option<Serial>,
     /// Holds the configures the server has sent out
     /// to the client waiting to be acknowledged by
     /// the client. All pending configures that are older
@@ -114,6 +117,7 @@ impl LayerSurfaceAttributes {
         Self {
             surface,
             initial_configure_sent: false,
+            initial_configure_serial: None,
             pending_configures: Vec::new(),
             server_pending: None,
             last_acked: None,
@@ -135,6 +139,7 @@ impl LayerSurfaceAttributes {
 
     fn reset(&mut self) {
         self.initial_configure_sent = false;
+        self.initial_configure_serial = None;
         self.pending_configures = Vec::new();
         self.server_pending = None;
         self.last_acked = None;
@@ -380,6 +385,9 @@ impl LayerSurface {
 
             attributes.pending_configures.push(configure);
             attributes.initial_configure_sent = true;
+            attributes
+                .initial_configure_serial
+                .get_or_insert(configure.serial);
 
             configure
         });
@@ -533,7 +541,10 @@ impl LayerSurface {
             let got_unmapped = had_buffer_before && !has_buffer;
 
             if has_buffer {
-                let Some(last_acked) = role.last_acked else {
+                let Some(last_acked) = role.last_acked.filter(|configure| {
+                    role.initial_configure_serial
+                        .is_some_and(|initial| configure.serial >= initial)
+                }) else {
                     role.surface.post_error(
                         zwlr_layer_surface_v1::Error::InvalidSurfaceState,
                         "must ack the initial configure before attaching buffer",
