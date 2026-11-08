@@ -86,6 +86,15 @@ impl<U: Clone + Send + Sync + 'static> SeatData<U> {
         D: SelectionHandler<SelectionUserData = U> + 'static,
     {
         if self.primary_selection_focus != new_focus {
+            if let Some(previous) = self.primary_selection_focus.as_ref() {
+                for device in &self.known_devices {
+                    if matches!(device, SelectionDevice::Primary(_))
+                        && dh.get_client(device.id()).is_ok_and(|client| &client == previous)
+                    {
+                        device.unset_primary_selection();
+                    }
+                }
+            }
             self.primary_generation.1 = self.primary_generation.1.wrapping_add(1);
             self.primary_selection_focus = new_focus;
             self.send_selection::<D>(dh, SelectionTarget::Primary, None, false)

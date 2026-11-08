@@ -52,7 +52,7 @@ where
         };
 
         match request {
-            primary_device::Request::SetSelection { source, .. } => {
+            primary_device::Request::SetSelection { source, serial } => {
                 let seat_data = match seat.get_keyboard() {
                     Some(keyboard) if keyboard.client_of_object_has_focus(&resource.id()) => seat
                         .user_data()
@@ -66,6 +66,10 @@ where
                         return;
                     }
                 };
+
+                if !handler.allow_selection(&seat, serial.into()) {
+                    return;
+                }
 
                 // NOTE: While protocol states that selection shouldn't be used more than once,
                 // no-one enforces it, thus we have clients around that do so and crashing them

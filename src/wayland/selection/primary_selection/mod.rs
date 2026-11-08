@@ -87,6 +87,7 @@ use wayland_server::{Client, DisplayHandle, GlobalDispatch};
 
 use crate::{
     input::{Seat, SeatHandler},
+    utils::Serial,
     wayland::selection::SelectionTarget,
 };
 
@@ -104,6 +105,12 @@ use super::{offer::OfferReplySource, seat_data::SeatData};
 pub trait PrimarySelectionHandler: Sized + SeatHandler + SelectionHandler {
     /// [PrimarySelectionState] getter.
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState;
+
+    /// Authorize the input serial of a focused client's selection request.
+    fn allow_selection(&mut self, seat: &Seat<Self>, serial: Serial) -> bool {
+        let _ = (seat, serial);
+        true
+    }
 }
 
 /// State of the primary selection.
@@ -320,7 +327,7 @@ mod handlers {
         input::{Seat, SeatHandler},
         wayland::{
             Dispatch2, GlobalData, GlobalDispatch2,
-            selection::{device::SelectionDevice, seat_data::SeatData},
+            selection::{SelectionTarget, device::SelectionDevice, seat_data::SeatData},
         },
     };
 
@@ -389,7 +396,14 @@ mod handlers {
                                 .get::<RefCell<SeatData<D::SelectionUserData>>>()
                                 .unwrap();
 
-                            seat_data.borrow_mut().add_device(device);
+                            let mut seat_data = seat_data.borrow_mut();
+                            seat_data.add_device(device.clone());
+                            seat_data.send_selection::<D>(
+                                dhandle,
+                                SelectionTarget::Primary,
+                                Some(&device),
+                                false,
+                            );
                         }
                         None => {
                             error!(
