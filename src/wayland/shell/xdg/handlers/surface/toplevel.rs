@@ -194,6 +194,7 @@ where
         {
             let toplevel = state.xdg_shell_state().known_toplevels.remove(index);
             let surface = toplevel.wl_surface().clone();
+            crate::wayland::xdg_foreign::toplevel_destroyed(state, &surface, &xdg_toplevel.id());
             XdgShellHandler::toplevel_destroyed(state, toplevel);
             compositor::with_states(&surface, |states| {
                 *states
@@ -263,6 +264,10 @@ pub fn set_parent(toplevel: &xdg_toplevel::XdgToplevel, parent: Option<wl_surfac
     with_surface_toplevel_role_data(toplevel, |data| {
         data.parent = parent;
     });
+
+    crate::wayland::xdg_foreign::reset_parent_ownership(
+        &toplevel.data::<XdgShellSurfaceUserData>().unwrap().wl_surface,
+    );
 
     true
 }

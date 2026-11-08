@@ -30,15 +30,21 @@
 //! ```
 
 use std::{
+    any::Any,
     collections::{HashMap, HashSet},
     ops::Deref,
+    sync::Mutex,
 };
 
 use rand::distr::{Alphanumeric, SampleString};
 use wayland_protocols::xdg::foreign::zv2::server::{
     zxdg_exporter_v2::ZxdgExporterV2, zxdg_imported_v2::ZxdgImportedV2, zxdg_importer_v2::ZxdgImporterV2,
 };
-use wayland_server::{DisplayHandle, GlobalDispatch, backend::GlobalId, protocol::wl_surface::WlSurface};
+use wayland_server::{
+    DisplayHandle, GlobalDispatch,
+    backend::{GlobalId, ObjectId},
+    protocol::wl_surface::WlSurface,
+};
 
 use crate::wayland::GlobalData;
 
@@ -88,14 +94,48 @@ pub struct XdgImportedUserData {
 #[derive(Debug)]
 struct ExportedState {
     exported_surface: WlSurface,
-    requested_child: Option<(WlSurface, ZxdgImportedV2)>,
+    role: ObjectId,
     imported_by: HashSet<ZxdgImportedV2>,
+}
+
+#[derive(Debug)]
+struct Child {
+    surface: WlSurface,
+    role: ObjectId,
+    exported: XdgForeignHandle,
+    imported: ZxdgImportedV2,
+}
+
+struct ForeignSurfaceData {
+    imported_parent: Mutex<Option<ObjectId>>,
+    destroyed: fn(&mut dyn Any, &WlSurface, Option<&ObjectId>),
+}
+
+pub(crate) fn reset_parent_ownership(surface: &WlSurface) {
+    crate::wayland::compositor::with_states(surface, |states| {
+        if let Some(data) = states.data_map.get::<ForeignSurfaceData>() {
+            *data.imported_parent.lock().unwrap() = None;
+        }
+    });
+}
+
+pub(crate) fn toplevel_destroyed<D: 'static>(state: &mut D, surface: &WlSurface, role: &ObjectId) {
+    let hook = crate::wayland::compositor::with_states(surface, |states| {
+        states
+            .data_map
+            .get::<ForeignSurfaceData>()
+            .map(|data| data.destroyed)
+    });
+    if let Some(hook) = hook {
+        hook(state, surface, Some(role));
+    }
 }
 
 /// Tracks the list of exported surfaces
 #[derive(Debug)]
 pub struct XdgForeignState {
     exported: HashMap<XdgForeignHandle, ExportedState>,
+    children: HashMap<ObjectId, Child>,
     exporter: GlobalId,
     importer: GlobalId,
 }
@@ -115,6 +155,7 @@ impl XdgForeignState {
 
         Self {
             exported: HashMap::new(),
+            children: HashMap::new(),
             exporter,
             importer,
         }

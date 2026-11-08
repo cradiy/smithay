@@ -32,6 +32,7 @@ use super::{
 
 mod toplevel;
 use toplevel::make_toplevel_handle;
+pub(crate) use toplevel::set_parent;
 pub use toplevel::{get_parent, send_toplevel_configure};
 
 mod popup;
