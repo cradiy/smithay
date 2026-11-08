@@ -377,50 +377,57 @@ impl RendererSurfaceState {
 /// become usable for surfaces handled this way.
 #[profiling::function]
 pub fn on_commit_buffer_handler<D: 'static>(surface: &WlSurface) {
-    if !is_sync_subsurface(surface) {
-        let mut new_surfaces = Vec::new();
-        with_surface_tree_upward(
-            surface,
-            (),
-            |_, _, _| TraversalAction::DoChildren(()),
-            |surf, states, _| {
-                if states
-                    .data_map
-                    .insert_if_missing_threadsafe(|| Mutex::new(RendererSurfaceState::default()))
-                {
-                    new_surfaces.push(surf.clone());
-                }
-                let mut data = states
+    // A blocked desynchronized commit can apply after the surface switches to
+    // sync. Consume its current buffer; only roots need to revisit descendants.
+    let sync = is_sync_subsurface(surface);
+    let mut new_surfaces = Vec::new();
+    with_surface_tree_upward(
+        surface,
+        (),
+        |_, _, _| {
+            if sync {
+                TraversalAction::SkipChildren
+            } else {
+                TraversalAction::DoChildren(())
+            }
+        },
+        |surf, states, _| {
+            if states
+                .data_map
+                .insert_if_missing_threadsafe(|| Mutex::new(RendererSurfaceState::default()))
+            {
+                new_surfaces.push(surf.clone());
+            }
+            let mut data = states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .unwrap()
+                .lock()
+                .unwrap();
+            data.update_buffer(states);
+        },
+        |_, _, _| true,
+    );
+    for surf in &new_surfaces {
+        add_destruction_hook(surf, |_: &mut D, surface| {
+            // We reset the state on destruction before the user_data is dropped
+            // to prevent a deadlock which can happen if we try to send a buffer
+            // release during drop. This also enables us to free resources earlier
+            // like the stored textures
+            compositor::with_states(surface, |data| {
+                if let Some(mut state) = data
                     .data_map
                     .get::<RendererSurfaceStateUserData>()
-                    .unwrap()
-                    .lock()
-                    .unwrap();
-                data.update_buffer(states);
-            },
-            |_, _, _| true,
-        );
-        for surf in &new_surfaces {
-            add_destruction_hook(surf, |_: &mut D, surface| {
-                // We reset the state on destruction before the user_data is dropped
-                // to prevent a deadlock which can happen if we try to send a buffer
-                // release during drop. This also enables us to free resources earlier
-                // like the stored textures
-                compositor::with_states(surface, |data| {
-                    if let Some(mut state) = data
-                        .data_map
-                        .get::<RendererSurfaceStateUserData>()
-                        .map(|s| s.lock().unwrap())
-                    {
-                        state.reset();
-                    }
-                    #[cfg(feature = "renderer_gl")]
-                    crate::backend::renderer::gles::clear_surface_textures(data);
-                    #[cfg(feature = "renderer_multi")]
-                    crate::backend::renderer::multigpu::clear_surface_textures(data);
-                });
+                    .map(|s| s.lock().unwrap())
+                {
+                    state.reset();
+                }
+                #[cfg(feature = "renderer_gl")]
+                crate::backend::renderer::gles::clear_surface_textures(data);
+                #[cfg(feature = "renderer_multi")]
+                crate::backend::renderer::multigpu::clear_surface_textures(data);
             });
-        }
+        });
     }
 }
 

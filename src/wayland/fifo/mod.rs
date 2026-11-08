@@ -183,7 +183,7 @@ where
         &self,
         _state: &mut D,
         _client: &wayland_server::Client,
-        _resource: &WpFifoManagerV1,
+        resource: &WpFifoManagerV1,
         request: wp_fifo_manager_v1::Request,
         _dhandle: &DisplayHandle,
         data_init: &mut DataInit<'_, D>,
@@ -200,7 +200,7 @@ where
 
                 // The protocol mandates that only a single fifo object is associated with a surface at all times
                 if has_active_fifo {
-                    surface.post_error(
+                    resource.post_error(
                         wp_fifo_manager_v1::Error::AlreadyExists,
                         "the surface has already a fifo object associated",
                     );
