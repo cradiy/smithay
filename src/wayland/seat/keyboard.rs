@@ -246,6 +246,11 @@ pub(crate) fn enter_internal<D: SeatHandler + 'static>(
         input_method.deactivate_input_method(state);
     }
 
+    if !state.allow_input_method(&seat.get_keyboard().unwrap()) {
+        text_input.set_focus(None);
+        return;
+    }
+
     // NOTE: Always set focus regardless whether the client actually has the
     // text-input global bound due to clients doing lazy global binding.
     text_input.set_focus(Some(surface.clone()));

@@ -166,6 +166,13 @@ pub trait SeatHandler: Sized + 'static {
     /// Callback that will be notified whenever the focus of the seat changes.
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&Self::KeyboardFocus>) {}
 
+    /// Whether Wayland text input and input-method keyboard grabs are allowed.
+    /// Revoke existing grabs and reset focus when changing this policy.
+    /// Called from keyboard dispatch; do not reenter the supplied handle.
+    fn allow_input_method(&self, _keyboard: &KeyboardHandle<Self>) -> bool {
+        true
+    }
+
     /// Callback that will be notified whenever a client requests to set a custom cursor image.
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
 

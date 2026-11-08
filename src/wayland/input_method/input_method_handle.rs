@@ -346,11 +346,14 @@ where
             }
             zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
                 let input_method = self.handle.inner.lock().unwrap();
-                self.keyboard_handle.set_grab(
-                    state,
-                    input_method.keyboard_grab.clone(),
-                    SERIAL_COUNTER.next_serial(),
-                );
+                let allowed = state.allow_input_method(&self.keyboard_handle);
+                if allowed {
+                    self.keyboard_handle.set_grab(
+                        state,
+                        input_method.keyboard_grab.clone(),
+                        SERIAL_COUNTER.next_serial(),
+                    );
+                }
                 let instance = data_init.init(
                     keyboard,
                     InputMethodKeyboardUserData {
@@ -375,14 +378,16 @@ where
 
                     // Modifiers can be latched when taking the grab, thus we must send them to keep
                     // them in sync.
-                    let mods = guard.mods_state.serialized;
-                    instance.modifiers(
-                        SERIAL_COUNTER.next_serial().into(),
-                        mods.depressed,
-                        mods.latched,
-                        mods.locked,
-                        mods.layout_effective,
-                    );
+                    if allowed {
+                        let mods = guard.mods_state.serialized;
+                        instance.modifiers(
+                            SERIAL_COUNTER.next_serial().into(),
+                            mods.depressed,
+                            mods.latched,
+                            mods.locked,
+                            mods.layout_effective,
+                        );
+                    }
                 }
             }
             zwp_input_method_v2::Request::Destroy => {
