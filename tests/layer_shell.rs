@@ -427,3 +427,24 @@ fn a_destroyed_layer_role_can_be_recreated_after_its_buffer_is_removed() {
     assert_eq!(runtime.state.layers.len(), 1);
     assert_eq!(runtime.state.commits.last(), Some(&Some(configured.into())));
 }
+
+#[test]
+fn unsigned_layer_size_requests_can_be_constrained_and_mapped_without_signed_truncation() {
+    let (mut runtime, mut wire) = Runtime::new();
+    let (surface, layer) = wire.layer();
+    layer.set_size(u32::MAX, u32::MAX);
+    surface.commit();
+    wire.sync(&mut runtime).unwrap();
+    assert_eq!(
+        runtime.state.layers[0].with_cached_state(|state| state.size),
+        (u32::MAX, u32::MAX).into()
+    );
+    let configure = runtime.configure((20, 10));
+    wire.sync(&mut runtime).unwrap();
+    layer.ack_configure(configure);
+    let buffer = wire.buffer();
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    wire.sync(&mut runtime).unwrap();
+    assert_eq!(runtime.state.commits.last(), Some(&Some(configure.into())));
+}

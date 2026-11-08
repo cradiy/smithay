@@ -173,7 +173,7 @@ pub struct LayerSurfaceState {
 #[derive(Debug, Default, Copy, Clone)]
 pub struct LayerSurfaceCachedState {
     /// The size requested by the client
-    pub size: Size<i32, Logical>,
+    pub size: Size<u32, Logical>,
     /// Anchor bitflags, describing how the layers surface should be positioned and sized
     pub anchor: Anchor,
     /// Description of exclusive zone

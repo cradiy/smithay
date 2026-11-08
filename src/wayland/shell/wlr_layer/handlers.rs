@@ -202,7 +202,7 @@ where
         match request {
             zwlr_layer_surface_v1::Request::SetSize { width, height } => {
                 let _ = with_surface_pending_state(layer_surface, |data| {
-                    data.size = (width as i32, height as i32).into();
+                    data.size = (width, height).into();
                 });
             }
             zwlr_layer_surface_v1::Request::SetAnchor { anchor } => {

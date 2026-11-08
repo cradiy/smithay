@@ -330,7 +330,10 @@ impl LayerMap {
                     source.size.h -= data.margin.bottom
                 }
 
-                let mut size: Size<_, Logical> = Size::new(Saturating(data.size.w), Saturating(data.size.h));
+                let mut size: Size<_, Logical> = Size::new(
+                    Saturating(data.size.w.min(i32::MAX as u32) as i32),
+                    Saturating(data.size.h.min(i32::MAX as u32) as i32),
+                );
                 size.w = size.w.min(source.size.w);
                 size.h = size.h.min(source.size.h);
                 if size.w.0 == 0 {
