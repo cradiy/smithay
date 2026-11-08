@@ -1,8 +1,8 @@
 use std::cell::RefCell;
 use std::sync::Mutex;
 
-use wayland_server::DisplayHandle;
 use wayland_server::backend::ClientId;
+use wayland_server::{DisplayHandle, Resource};
 
 use crate::input::Seat;
 use crate::wayland::Dispatch2;
@@ -47,15 +47,22 @@ where
 {
     fn request(
         &self,
-        _state: &mut D,
+        state: &mut D,
         _client: &wayland_server::Client,
-        _resource: &ExtDataControlSourceV1,
+        resource: &ExtDataControlSourceV1,
         request: <ExtDataControlSourceV1 as wayland_server::Resource>::Request,
         _dhandle: &DisplayHandle,
         _data_init: &mut wayland_server::DataInit<'_, D>,
     ) {
         match request {
             ext_data_control_source_v1::Request::Offer { mime_type } => {
+                if state.data_control_state().used_sources.contains_key(resource) {
+                    resource.post_error(
+                        ext_data_control_source_v1::Error::InvalidOffer,
+                        "MIME types must be offered before the source is used.",
+                    );
+                    return;
+                }
                 let mut data = self.inner.lock().unwrap();
                 data.mime_types.push(mime_type);
             }
