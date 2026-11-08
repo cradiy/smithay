@@ -68,9 +68,10 @@ impl KeymapFile {
 
             let mut file = tempfile::tempfile_in(dir)?;
             file.write_all(self.0.keymap.as_bytes())?;
+            file.write_all(&[0])?;
             file.flush()?;
 
-            cb(file.as_fd(), self.0.keymap.len());
+            cb(file.as_fd(), self.0.keymap.len() + 1);
         }
         Ok(())
     }
@@ -110,6 +111,35 @@ mod tests {
 
         assert_ne!(id1, id2);
         assert_eq!(id1, id3);
+    }
+
+    #[test]
+    fn wire_keymaps_include_a_terminating_nul_for_sealed_and_mutable_clients() {
+        use std::{ffi::CStr, fs::File, os::unix::fs::FileExt};
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = crate::input::keyboard::XkbConfig::default()
+            .compile_keymap(&context)
+            .unwrap();
+        let file = KeymapFile::new(&keymap);
+        for sealed in [false, true] {
+            file.with_fd(sealed, |fd, size| {
+                let mut bytes = vec![0; size];
+                File::from(fd.try_clone_to_owned().unwrap())
+                    .read_exact_at(&mut bytes, 0)
+                    .unwrap();
+                let text = CStr::from_bytes_with_nul(&bytes).expect("wire size includes one terminating NUL");
+                assert!(
+                    xkb::Keymap::new_from_string(
+                        &context,
+                        text.to_str().unwrap().into(),
+                        xkb::KEYMAP_FORMAT_TEXT_V1,
+                        xkb::KEYMAP_COMPILE_NO_FLAGS
+                    )
+                    .is_some()
+                );
+            })
+            .unwrap();
+        }
     }
 
     #[test]
