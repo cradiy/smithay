@@ -74,6 +74,10 @@ impl WlrLayerShellHandler for State {
     fn new_layer_surface(&mut self, surface: LayerSurface, _: Option<WlOutput>, _: Layer, _: String) {
         self.layers.push(surface);
     }
+    fn layer_destroyed(&mut self, surface: LayerSurface) {
+        self.layers
+            .retain(|known| known.shell_surface() != surface.shell_surface());
+    }
 }
 smithay::delegate_dispatch2!(State);
 
@@ -218,16 +222,20 @@ impl Wire {
     fn layer(&self) -> (wl_surface::WlSurface, layer::ZwlrLayerSurfaceV1) {
         let queue = self.queue.handle();
         let surface = self.probe.compositor.as_ref().unwrap().create_surface(&queue, ());
+        let layer = self.role(&surface);
+        (surface, layer)
+    }
+    fn role(&self, surface: &wl_surface::WlSurface) -> layer::ZwlrLayerSurfaceV1 {
         let layer = self.probe.shell.as_ref().unwrap().get_layer_surface(
-            &surface,
+            surface,
             None,
             shell::Layer::Top,
             "test".into(),
-            &queue,
+            &self.queue.handle(),
             (),
         );
         layer.set_size(20, 10);
-        (surface, layer)
+        layer
     }
     fn buffer(&self) -> wl_buffer::WlBuffer {
         let file = tempfile::tempfile().unwrap();
@@ -337,4 +345,85 @@ fn an_in_flight_ack_is_accepted_without_a_buffer_then_the_new_configure_can_map(
     case.surface.commit();
     case.wire.sync(&mut case.runtime).unwrap();
     assert_eq!(case.runtime.state.commits.last(), Some(&Some(new.into())));
+}
+
+#[test]
+fn layer_creation_rejects_pending_and_committed_buffers_before_admitting_the_role() {
+    for (commit_buffer, queue_removal) in [(false, false), (true, false), (true, true)] {
+        let (mut runtime, mut wire) = Runtime::new();
+        let surface = wire
+            .probe
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&wire.queue.handle(), ());
+        let buffer = wire.buffer();
+        surface.attach(Some(&buffer), 0, 0);
+        if commit_buffer {
+            surface.commit();
+            wire.sync(&mut runtime).unwrap();
+        }
+        if queue_removal {
+            surface.attach(None, 0, 0);
+        }
+        let _role = wire.role(&surface);
+        assert!(
+            wire.sync(&mut runtime).is_err(),
+            "a buffered surface acquired a layer role: committed={commit_buffer}, removal_pending={queue_removal}"
+        );
+        let error = wire.connection.protocol_error().unwrap();
+        assert_eq!(error.object_interface, "zwlr_layer_shell_v1");
+        assert_eq!(error.code, shell::Error::AlreadyConstructed as u32);
+        assert!(
+            runtime.state.layers.is_empty(),
+            "an invalid role reached the compositor handler"
+        );
+    }
+}
+
+#[test]
+fn a_surface_cannot_have_two_live_layer_role_objects() {
+    let (mut runtime, mut wire) = Runtime::new();
+    let (surface, _first) = wire.layer();
+    wire.sync(&mut runtime).unwrap();
+    let _second = wire.role(&surface);
+    assert!(
+        wire.sync(&mut runtime).is_err(),
+        "a second live role replaced the surface's layer state"
+    );
+    let error = wire.connection.protocol_error().unwrap();
+    assert_eq!(error.object_interface, "zwlr_layer_shell_v1");
+    assert_eq!(error.code, shell::Error::Role as u32);
+}
+
+#[test]
+fn a_destroyed_layer_role_can_be_recreated_after_its_buffer_is_removed() {
+    let (mut runtime, mut wire) = Runtime::new();
+    let (surface, first) = wire.layer();
+    surface.commit();
+    wire.sync(&mut runtime).unwrap();
+    let initial = runtime.configure((20, 10));
+    wire.sync(&mut runtime).unwrap();
+    let buffer = wire.buffer();
+    first.ack_configure(initial);
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    wire.sync(&mut runtime).unwrap();
+    first.destroy();
+    surface.attach(None, 0, 0);
+    surface.commit();
+    wire.sync(&mut runtime).unwrap();
+    assert!(runtime.state.layers.is_empty());
+    let replacement = wire.role(&surface);
+    surface.commit();
+    wire.sync(&mut runtime).unwrap();
+    assert_eq!(runtime.state.commits.last(), Some(&None));
+    let configured = runtime.configure((20, 10));
+    wire.sync(&mut runtime).unwrap();
+    replacement.ack_configure(configured);
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    wire.sync(&mut runtime).unwrap();
+    assert_eq!(runtime.state.layers.len(), 1);
+    assert_eq!(runtime.state.commits.last(), Some(&Some(configured.into())));
 }

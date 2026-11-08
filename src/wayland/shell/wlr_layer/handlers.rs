@@ -81,8 +81,23 @@ where
                     }
                 };
 
-                if compositor::give_role(&wl_surface, LAYER_SURFACE_ROLE).is_err() {
+                let has_live_role = state
+                    .shell_state()
+                    .known_layers
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|layer| layer.wl_surface() == &wl_surface && layer.alive());
+                if has_live_role || compositor::give_role(&wl_surface, LAYER_SURFACE_ROLE).is_err() {
                     shell.post_error(zwlr_layer_shell_v1::Error::Role, "Surface already has a role.");
+                    return;
+                }
+
+                if super::super::has_buffer(&wl_surface) {
+                    shell.post_error(
+                        zwlr_layer_shell_v1::Error::AlreadyConstructed,
+                        "Surface has a buffer attached or committed.",
+                    );
                     return;
                 }
 

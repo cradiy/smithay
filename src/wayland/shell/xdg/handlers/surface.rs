@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use indexmap::IndexSet;
 
 use crate::utils::alive_tracker::{AliveTracker, IsAlive};
+use crate::wayland::shell::has_buffer;
 use crate::wayland::shell::xdg::{XdgPopupSurfaceData, XdgToplevelSurfaceData};
 use crate::{
     utils::{Rectangle, Serial},
@@ -414,30 +415,6 @@ pub(super) fn has_live_role<D: super::super::XdgShellHandler>(
             .known_popups
             .iter()
             .any(|role| role.wl_surface() == surface && role.alive())
-}
-
-pub(super) fn has_buffer(surface: &wl_surface::WlSurface) -> bool {
-    compositor::with_states(surface, |states| {
-        use crate::{
-            backend::renderer::utils::RendererSurfaceStateUserData,
-            wayland::compositor::{BufferAssignment, SurfaceAttributes},
-        };
-        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-        let current = matches!(
-            attributes.current().buffer.as_ref(),
-            Some(BufferAssignment::NewBuffer(_))
-        );
-        let pending = matches!(
-            attributes.pending().buffer.as_ref(),
-            Some(BufferAssignment::NewBuffer(_))
-        );
-        current
-            || pending
-            || states
-                .data_map
-                .get::<RendererSurfaceStateUserData>()
-                .is_some_and(|state| state.lock().unwrap().buffer().is_some())
-    })
 }
 
 impl IsAlive for XdgPopup {

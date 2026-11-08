@@ -66,7 +66,7 @@ where
                     wm_base.post_error(xdg_wm_base::Error::Role, "wl_surface already has a role");
                     return;
                 }
-                if super::surface::has_buffer(&surface) {
+                if crate::wayland::shell::has_buffer(&surface) {
                     wm_base.post_error(
                         xdg_wm_base::Error::InvalidSurfaceState,
                         "wl_surface already has a buffer",

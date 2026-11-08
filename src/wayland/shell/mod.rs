@@ -24,6 +24,30 @@ pub mod kde;
 pub mod wlr_layer;
 pub mod xdg;
 
+fn has_buffer(surface: &WlSurface) -> bool {
+    compositor::with_states(surface, |states| {
+        use crate::{
+            backend::renderer::utils::RendererSurfaceStateUserData,
+            wayland::compositor::{BufferAssignment, SurfaceAttributes},
+        };
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        let current = matches!(
+            attributes.current().buffer.as_ref(),
+            Some(BufferAssignment::NewBuffer(_))
+        );
+        let pending = matches!(
+            attributes.pending().buffer.as_ref(),
+            Some(BufferAssignment::NewBuffer(_))
+        );
+        current
+            || pending
+            || states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .is_some_and(|state| state.lock().unwrap().buffer().is_some())
+    })
+}
+
 /// Represents the possible errors returned from
 /// a surface ping
 #[derive(Debug, Error)]
