@@ -373,6 +373,17 @@ impl<D: SeatHandler + 'static> TouchHandle<D> {
         });
     }
 
+    /// Update the desktop-space origin of an active contact's target without
+    /// changing its focus or emitting input. Call this when the target moves,
+    /// before delivering motion or dispatching new Wayland touch bindings.
+    pub fn update_focus_origin(&self, slot: TouchSlot, origin: Point<f64, Logical>) {
+        if let Some(state) = self.arc.inner.lock().unwrap().focus.get_mut(&slot) {
+            if let Some((_, current)) = &mut state.focus {
+                *current = origin;
+            }
+        }
+    }
+
     /// Notify about the end of a set of events that logically belong together.
     ///
     /// This needs to be called after one or move calls to [`TouchHandle::down`] or [`TouchHandle::motion`]

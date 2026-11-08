@@ -58,6 +58,7 @@ struct Probe {
     compositor: Option<wl_compositor::WlCompositor>,
     seat: Option<wl_seat::WlSeat>,
     events: Vec<(usize, Event)>,
+    coordinates: Vec<(usize, i32, f64, f64)>,
 }
 #[derive(Debug, PartialEq)]
 enum Event {
@@ -94,7 +95,14 @@ impl Dispatch<wl_touch::WlTouch, usize> for Probe {
         _: &QueueHandle<Self>,
     ) {
         let event = match event {
-            wl_touch::Event::Down { id, .. } => Event::Down(id),
+            wl_touch::Event::Down { id: slot, x, y, .. } => {
+                state.coordinates.push((*id, slot, x, y));
+                Event::Down(slot)
+            }
+            wl_touch::Event::Motion { id: slot, x, y, .. } => {
+                state.coordinates.push((*id, slot, x, y));
+                return;
+            }
             wl_touch::Event::Up { id, .. } => Event::Up(id),
             wl_touch::Event::Frame => Event::Frame,
             wl_touch::Event::Cancel => Event::Cancel,
@@ -323,4 +331,35 @@ fn cancellation_includes_unchanged_contacts_and_pending_up_without_leaking_into_
             (1, Event::Cancel)
         ]
     );
+}
+
+#[test]
+fn moved_target_origins_apply_to_motion_and_late_binding_replay() {
+    let mut runtime = Runtime::new();
+    let mut wire = runtime.client();
+    let surface = wire.surface(&mut runtime);
+    let _first = wire.touch(0);
+    wire.sync(&mut runtime);
+    runtime.down(&surface, 0);
+    runtime.frame();
+    wire.sync(&mut runtime);
+    wire.probe.coordinates.clear();
+    runtime
+        .touch
+        .update_focus_origin(Some(0).into(), (10., 20.).into());
+    let _late = wire.touch(1);
+    wire.sync(&mut runtime);
+    assert_eq!(std::mem::take(&mut wire.probe.coordinates), [(1, 0, -9., -19.)]);
+    runtime.touch.clone().motion(
+        &mut runtime.state,
+        None,
+        &smithay::input::touch::MotionEvent {
+            slot: Some(0).into(),
+            location: (13., 24.).into(),
+            time: InputTime::from_micros(2000),
+        },
+    );
+    runtime.frame();
+    wire.sync(&mut runtime);
+    assert_eq!(wire.probe.coordinates, [(0, 0, 3., 4.), (1, 0, 3., 4.)]);
 }
