@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::Ordering};
 
 use portable_atomic::AtomicF64;
-use tracing::{trace, warn, warn_span};
+use tracing::{trace, trace_span, warn};
 use wayland_protocols::xdg::xdg_output::zv1::server::{
     zxdg_output_manager_v1::{self, ZxdgOutputManagerV1},
     zxdg_output_v1::{self, ZxdgOutputV1},
@@ -51,7 +51,7 @@ where
         };
         let mut inner = handle.inner.0.lock().unwrap();
 
-        let span = warn_span!("output_bind", name = inner.name);
+        let span = trace_span!("output_bind", name = inner.name);
         let _enter = span.enter();
 
         trace!("New WlOutput global instantiated");
