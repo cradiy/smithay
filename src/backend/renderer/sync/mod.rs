@@ -1,5 +1,13 @@
 //! Helper for synchronizing rendering operations
-use std::{error::Error, fmt, os::unix::io::OwnedFd, sync::Arc};
+use std::{
+    error::Error,
+    fmt,
+    os::unix::io::OwnedFd,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use downcast_rs::{Downcast, impl_downcast};
 
@@ -41,7 +49,13 @@ impl_downcast!(Fence);
 #[derive(Debug, Clone)]
 #[must_use = "this `SyncPoint` may contain a fence that should be awaited, failing to do so may result in unexpected rendering artifacts"]
 pub struct SyncPoint {
-    fence: Option<Arc<dyn Fence>>,
+    fence: Option<Arc<SharedFence<dyn Fence>>>,
+}
+
+#[derive(Debug)]
+struct SharedFence<F: ?Sized> {
+    reached: AtomicBool,
+    fence: F,
 }
 
 impl Default for SyncPoint {
@@ -68,14 +82,38 @@ impl SyncPoint {
     /// Returns `None` if the sync point does not contain a fence
     /// or contains a different type of fence
     pub fn get<F: Fence + 'static>(&self) -> Option<&F> {
-        self.fence.as_ref().and_then(|f| f.downcast_ref())
+        self.fence.as_ref().and_then(|f| f.fence.downcast_ref())
     }
 
     /// Queries the state of the sync point
     ///
     /// Will always return `true` in case the sync point does not contain a fence
     pub fn is_reached(&self) -> bool {
-        self.fence.as_ref().map(|f| f.is_signaled()).unwrap_or(true)
+        self.fence
+            .as_ref()
+            .map(|f| {
+                if f.reached.load(Ordering::Acquire) {
+                    return true;
+                }
+                if f.fence.is_signaled() {
+                    f.reached.store(true, Ordering::Release);
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(true)
+    }
+
+    /// Record completion proven outside the backend, for example by polling an
+    /// exported sync file. The caller must verify completion of this exact
+    /// point before calling this method. All clones retain that proof, so later
+    /// queries and waits no longer depend on a potentially lost device.
+    /// Completion does not establish successful execution of rendering work.
+    pub fn mark_reached(&self) {
+        if let Some(fence) = &self.fence {
+            fence.reached.store(true, Ordering::Release);
+        }
     }
 
     /// Blocks the current thread until the sync point is signaled
@@ -84,7 +122,11 @@ impl SyncPoint {
     #[profiling::function]
     pub fn wait(&self) -> Result<(), Interrupted> {
         if let Some(fence) = self.fence.as_ref() {
-            fence.wait()
+            if !fence.reached.load(Ordering::Acquire) {
+                fence.fence.wait()?;
+                fence.reached.store(true, Ordering::Release);
+            }
+            Ok(())
         } else {
             Ok(())
         }
@@ -94,7 +136,10 @@ impl SyncPoint {
     ///
     /// Will always return `false` in case the sync point does not contain a fence
     pub fn is_exportable(&self) -> bool {
-        self.fence.as_ref().map(|f| f.is_exportable()).unwrap_or(false)
+        self.fence
+            .as_ref()
+            .map(|f| f.fence.is_exportable())
+            .unwrap_or(false)
     }
 
     /// Export this [`SyncPoint`] as a native fence fd
@@ -102,7 +147,7 @@ impl SyncPoint {
     /// Will always return `None` in case the sync point does not contain a fence
     #[profiling::function]
     pub fn export(&self) -> Option<OwnedFd> {
-        self.fence.as_ref().and_then(|f| f.export())
+        self.fence.as_ref().and_then(|f| f.fence.export())
     }
 }
 
@@ -110,7 +155,10 @@ impl<T: Fence + 'static> From<T> for SyncPoint {
     #[inline]
     fn from(value: T) -> Self {
         SyncPoint {
-            fence: Some(Arc::new(value)),
+            fence: Some(Arc::new(SharedFence {
+                reached: AtomicBool::new(false),
+                fence: value,
+            })),
         }
     }
 }
