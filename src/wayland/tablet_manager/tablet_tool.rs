@@ -634,15 +634,6 @@ where
     D: TabletSeatHandler + 'static,
     <D as TabletSeatHandler>::ToolFocus: WaylandFocus,
 {
-    // Allow client if there is a tool grab for that client. Like drag and drop.
-    if handle
-        .grab_start_data()
-        .and_then(|data| data.focus)
-        .is_some_and(|focus| focus.0.same_client_as(object_id))
-    {
-        return true;
-    }
-
     if !handle
         .arc
         .wp_tablet_tool
@@ -652,6 +643,15 @@ where
         .is_some_and(|last_serial| last_serial == serial)
     {
         return false; // Ignore mismatches in serial
+    }
+
+    // Allow client if there is a tool grab for that client. Like drag and drop.
+    if handle
+        .grab_start_data()
+        .and_then(|data| data.focus)
+        .is_some_and(|focus| focus.0.same_client_as(object_id))
+    {
+        return true;
     }
 
     // Only allow setting the cursor icon if the current tool focus is of the same
