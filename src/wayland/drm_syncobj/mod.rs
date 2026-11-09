@@ -41,7 +41,7 @@
 use std::{
     cell::RefCell,
     os::unix::io::AsFd,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, Weak},
 };
 use tracing::warn;
 use wayland_protocols::wp::linux_drm_syncobj::v1::server::{
@@ -125,7 +125,7 @@ impl Drop for DrmSyncobjCachedState {
     fn drop(&mut self) {
         // Points left in cached state were never handed to a renderer buffer.
         if let Some(point) = self.release_point.take() {
-            if let Err(err) = point.signal() {
+            if let Err(err) = point.signal_release() {
                 tracing::error!("Failed to release unused syncobj buffer: {err}");
             }
         }
@@ -141,6 +141,7 @@ pub struct DrmSyncobjState {
     global_data: DrmSyncobjGlobalData,
     import_device: Option<DrmDeviceFd>,
     known_timelines: Vec<Weak<DrmTimelineInner>>,
+    deferred_releases: Arc<sync_point::DeferredReleases>,
 }
 
 impl DrmSyncobjState {
@@ -175,6 +176,7 @@ impl DrmSyncobjState {
             global_data,
             import_device: Some(import_device),
             known_timelines: Vec::new(),
+            deferred_releases: Arc::new(Mutex::new(Default::default())),
         }
     }
 
@@ -192,6 +194,12 @@ impl DrmSyncobjState {
         for timeline in self.known_timelines.iter().filter_map(Weak::upgrade) {
             if let Err(err) = timeline.update_device(&import_device) {
                 warn!(?err, "Failed to update existing timeline");
+            }
+        }
+        let releases = std::mem::take(&mut *self.deferred_releases.lock().unwrap());
+        for point in releases.into_values() {
+            if let Err(err) = point.signal_release() {
+                warn!(?err, "Failed to signal deferred buffer release");
             }
         }
         self.import_device = Some(import_device);
@@ -373,7 +381,9 @@ where
                     state
                         .known_timelines
                         .retain(|timeline| timeline.strong_count() != 0);
-                    match state.import_device.as_ref().map(|dev| DrmTimeline::new(dev, fd)) {
+                    match state.import_device.as_ref().map(|dev| {
+                        DrmTimeline::new_with_release_queue(dev, fd, Arc::downgrade(&state.deferred_releases))
+                    }) {
                         Some(Ok(timeline)) => {
                             state.known_timelines.push(Arc::downgrade(&timeline.0));
                             data_init.init::<_, _>(id, DrmSyncobjTimelineData { timeline });
@@ -437,7 +447,7 @@ where
                         let mut cached = states.cached_state.get::<DrmSyncobjCachedState>();
                         cached.pending().acquire_point = None;
                         if let Some(release_point) = cached.pending().release_point.take() {
-                            if let Err(err) = release_point.signal() {
+                            if let Err(err) = release_point.signal_release() {
                                 tracing::error!("Failed to signal syncobj release point: {}", err);
                             }
                         }

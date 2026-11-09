@@ -70,7 +70,7 @@ impl Drop for InnerBuffer {
     fn drop(&mut self) {
         #[cfg(feature = "backend_drm")]
         if let Some(release_point) = &self.release_point {
-            if let Err(err) = release_point.signal() {
+            if let Err(err) = release_point.signal_release() {
                 tracing::error!("Failed to signal syncobj release point: {}", err);
             }
             return;

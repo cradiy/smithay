@@ -1,12 +1,12 @@
 use calloop::generic::Generic;
 use calloop::{EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory};
 use drm::control::Device;
-use std::sync::{Mutex, Weak};
 use std::{
+    collections::HashMap,
     io,
     os::unix::io::{AsFd, BorrowedFd, OwnedFd},
     sync::{
-        Arc,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -19,7 +19,10 @@ use crate::wayland::compositor::{Blocker, BlockerState};
 pub(super) struct DrmTimelineInner {
     timeline_fd: OwnedFd,
     dev_ctx: Mutex<DrmTimelineDeviceSpecific>,
+    deferred_releases: Weak<DeferredReleases>,
 }
+
+pub(super) type DeferredReleases = Mutex<HashMap<usize, DrmSyncPoint>>;
 
 impl DrmTimelineInner {
     pub(super) fn update_device(&self, device: &DrmDeviceFd) -> io::Result<()> {
@@ -94,10 +97,19 @@ impl PartialEq for DrmTimeline {
 impl DrmTimeline {
     /// Import DRM timeline from file descriptor
     pub fn new(device: &DrmDeviceFd, fd: OwnedFd) -> io::Result<Self> {
+        Self::new_with_release_queue(device, fd, Weak::new())
+    }
+
+    pub(super) fn new_with_release_queue(
+        device: &DrmDeviceFd,
+        fd: OwnedFd,
+        deferred_releases: Weak<DeferredReleases>,
+    ) -> io::Result<Self> {
         let dev_ctx = Mutex::new(DrmTimelineDeviceSpecific::import(fd.as_fd(), device)?);
         Ok(Self(Arc::new(DrmTimelineInner {
             timeline_fd: fd,
             dev_ctx,
+            deferred_releases,
         })))
     }
 
@@ -165,6 +177,38 @@ impl DrmSyncPoint {
             .as_ref()
             .ok_or::<io::Error>(io::ErrorKind::InvalidInput.into())?
             .syncobj_timeline_signal(&[ctx.syncobj], &[self.point])
+    }
+
+    // A completed buffer reader owns its release even while its device is
+    // absent. Keep one maximum point per timeline until the protocol owner can
+    // import it on a live device, including after the wire object is destroyed.
+    pub(crate) fn signal_release(&self) -> io::Result<()> {
+        let ctx = self.timeline.0.dev_ctx.lock().unwrap();
+        let error = match ctx.device.as_ref() {
+            Some(device) => match device.syncobj_timeline_signal(&[ctx.syncobj], &[self.point]) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(libc::ENODEV) => error,
+                Err(error) => return Err(error),
+            },
+            None => io::ErrorKind::InvalidInput.into(),
+        };
+        let Some(releases) = self.timeline.0.deferred_releases.upgrade() else {
+            return Err(error);
+        };
+        // The queued point retains this allocation, so its address cannot be
+        // reused for another timeline until this entry has been retired.
+        let key = Arc::as_ptr(&self.timeline.0) as usize;
+        releases
+            .lock()
+            .unwrap()
+            .entry(key)
+            .and_modify(|pending| pending.point = pending.point.max(self.point))
+            .or_insert_with(|| self.clone());
+        // Device replacement must not drain the queue between observing the
+        // absent device and inserting this release. The updater never holds
+        // the queue lock while taking a timeline's context lock.
+        drop(ctx);
+        Ok(())
     }
 
     /// Wait for sync point.
