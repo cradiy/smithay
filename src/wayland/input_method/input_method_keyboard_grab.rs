@@ -13,7 +13,7 @@ use crate::input::{
     SeatHandler,
     keyboard::{
         GrabStartData as KeyboardGrabStartData, KeyboardGrab, KeyboardHandle, KeyboardInnerHandle,
-        KeymapFileId, ModifiersState, SerializedMods,
+        KeymapFile, KeymapFileId, ModifiersState, SerializedMods,
     },
 };
 use crate::wayland::text_input::TextInputHandle;
@@ -30,10 +30,54 @@ pub(crate) struct InputMethodKeyboard {
     pub keymap_id: Option<KeymapFileId>,
 }
 
+impl InputMethodKeyboard {
+    fn sync_keymap(&mut self, keymap: &KeymapFile) -> std::io::Result<bool> {
+        let id = keymap.id();
+        if self.keymap_id == Some(id) {
+            return Ok(false);
+        }
+        let keyboard = self.grab.as_ref().unwrap();
+        keymap.with_fd(false, |fd, size| {
+            keyboard.keymap(KeymapFormat::XkbV1, fd, size as u32);
+        })?;
+        self.keymap_id = Some(id);
+        Ok(true)
+    }
+}
+
 /// Handle to an input method instance
 #[derive(Default, Debug, Clone)]
 pub struct InputMethodKeyboardGrab {
     pub(crate) inner: Arc<Mutex<InputMethodKeyboard>>,
+}
+
+impl InputMethodKeyboardGrab {
+    /// Synchronize the keymap and modifiers without forwarding a key event.
+    ///
+    /// A compositor can call this after filtering a modifier key so the input
+    /// method stays synchronized without receiving an unmatched press or release.
+    pub fn send_modifiers(&self, keymap: &KeymapFile, modifiers: SerializedMods, serial: Serial) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.grab.is_none() {
+            return;
+        }
+        if let Err(err) = inner.sync_keymap(keymap) {
+            warn!(err = ?err, "Failed to send keymap to input method");
+            return;
+        }
+        let keyboard = inner.grab.as_ref().unwrap();
+        inner
+            .text_input_handle
+            .active_text_input_serial_or_default(serial.0, |serial| {
+                keyboard.modifiers(
+                    serial,
+                    modifiers.depressed,
+                    modifiers.latched,
+                    modifiers.locked,
+                    modifiers.layout_effective,
+                );
+            });
+    }
 }
 
 impl<D> KeyboardGrab<D> for InputMethodKeyboardGrab
@@ -57,22 +101,13 @@ where
         // interpreted using it, so keep the grab in sync like wlroots does. The id is a hash of the
         // content, so an input method sending the same keymap back through its own virtual keyboard
         // will not result in a loop of keymap updates.
-        let keymap_changed = handle.with_keymap_file(|keymap_file| {
-            let id = keymap_file.id();
-            if inner.keymap_id == Some(id) {
-                return false;
+        let keymap_changed = match handle.with_keymap_file(|keymap| inner.sync_keymap(keymap)) {
+            Ok(changed) => changed,
+            Err(err) => {
+                warn!(err = ?err, "Failed to send keymap to input method");
+                return;
             }
-            let keyboard = inner.grab.as_ref().unwrap();
-            let res = keymap_file.with_fd(false, |fd, size| {
-                keyboard.keymap(KeymapFormat::XkbV1, fd, size as u32);
-            });
-            if let Err(err) = res {
-                warn!(err = ?err, "Failed to send keymap to client");
-                return false;
-            }
-            inner.keymap_id = Some(id);
-            true
-        });
+        };
 
         // The client resets its state when it receives a new keymap, so send the full modifier
         // state before the key in that case. Otherwise, only send the modifiers if they changed.
