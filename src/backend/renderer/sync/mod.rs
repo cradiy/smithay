@@ -1,8 +1,8 @@
 //! Helper for synchronizing rendering operations
 use std::{
     error::Error,
-    fmt,
-    os::unix::io::OwnedFd,
+    fmt, io,
+    os::fd::{BorrowedFd, OwnedFd},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,6 +13,9 @@ use downcast_rs::{Downcast, impl_downcast};
 
 #[cfg(feature = "backend_egl")]
 mod egl;
+
+mod native;
+pub use native::sync_file_result;
 
 /// Waiting for the fence was interrupted for an unknown reason.
 ///
@@ -42,6 +45,11 @@ pub trait Fence: std::fmt::Debug + Send + Sync + Downcast {
 
     /// Export this fence as a native fence fd
     fn export(&self) -> Option<OwnedFd>;
+
+    /// Check the result of completed work without waiting. `native` must be
+    /// an fd exported from this exact fence, if available. A signaled fence
+    /// permits resource retirement even when its work failed.
+    fn completion_result(&self, native: Option<BorrowedFd<'_>>) -> io::Result<()>;
 }
 impl_downcast!(Fence);
 
@@ -114,6 +122,15 @@ impl SyncPoint {
         if let Some(fence) = &self.fence {
             fence.reached.store(true, Ordering::Release);
         }
+    }
+
+    /// Check the result after completion has been established. If supplied,
+    /// `native` must have been exported from this exact point. Completion and
+    /// successful execution are separate; this method does not wait.
+    pub fn completion_result(&self, native: Option<BorrowedFd<'_>>) -> io::Result<()> {
+        self.fence
+            .as_ref()
+            .map_or(Ok(()), |f| f.fence.completion_result(native))
     }
 
     /// Blocks the current thread until the sync point is signaled

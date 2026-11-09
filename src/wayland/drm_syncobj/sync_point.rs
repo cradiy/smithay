@@ -317,6 +317,14 @@ impl DrmSyncPoint {
 }
 
 impl Fence for DrmSyncPoint {
+    fn completion_result(&self, native: Option<BorrowedFd<'_>>) -> io::Result<()> {
+        if let Some(fd) = native {
+            return crate::backend::renderer::sync::sync_file_result(fd);
+        }
+        let fd = self.export_sync_file()?;
+        crate::backend::renderer::sync::sync_file_result(fd.as_fd())
+    }
+
     fn is_signaled(&self) -> bool {
         self.timeline
             .query_signalled_point()

@@ -1,4 +1,8 @@
-use std::{os::unix::io::OwnedFd, time::Duration};
+use std::{
+    io,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+    time::Duration,
+};
 
 use crate::backend::{
     egl::fence::EGLFence,
@@ -19,6 +23,23 @@ impl Fence for EGLFence {
 
     fn export(&self) -> Option<OwnedFd> {
         self.export().ok()
+    }
+
+    fn completion_result(&self, native: Option<BorrowedFd<'_>>) -> io::Result<()> {
+        if let Some(fd) = native {
+            return super::sync_file_result(fd);
+        }
+        if self.is_native() {
+            let fd = self.export().map_err(io::Error::other)?;
+            return super::sync_file_result(fd.as_fd());
+        }
+        match self
+            .client_wait(Some(Duration::ZERO), false)
+            .map_err(io::Error::other)?
+        {
+            true => Ok(()),
+            false => Err(io::ErrorKind::WouldBlock.into()),
+        }
     }
 
     fn is_signaled(&self) -> bool {
