@@ -69,10 +69,15 @@
 //! ```
 
 mod handlers;
+#[cfg(test)]
+mod tests;
 pub(crate) mod xdg;
 
 use std::mem;
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use crate::{
     output::{Inner, Mode, Output, Scale, Subpixel, WeakOutput},
@@ -108,7 +113,33 @@ pub struct OutputManagerState {
 /// Internal data of a wl_output global
 #[derive(Debug)]
 pub struct WlOutputData {
-    output: Output,
+    output: Arc<Mutex<Option<Output>>>,
+    active: Arc<AtomicBool>,
+    identity: WeakOutput,
+}
+
+/// A registered output global whose bindings can be made inert without
+/// destroying the registration. Dropping this handle does not remove the global.
+#[derive(Debug)]
+pub struct OutputGlobal {
+    id: GlobalId,
+    output: Arc<Mutex<Option<Output>>>,
+    active: Arc<AtomicBool>,
+}
+
+impl OutputGlobal {
+    /// The registration to remove once clients can no longer send in-flight binds.
+    pub fn global(&self) -> GlobalId {
+        self.id.clone()
+    }
+
+    /// Withdraw the advertisement and detach the output. Later binds initialize
+    /// inert resources, and the registration no longer keeps the output alive.
+    pub fn disable<D: 'static>(&self, display: &DisplayHandle) {
+        display.disable_global::<D>(self.id.clone());
+        self.active.store(false, Ordering::Release);
+        self.output.lock().unwrap().take();
+    }
 }
 
 /// Events initiated by the clients interacting with outputs
@@ -149,6 +180,7 @@ impl OutputManagerState {
 #[derive(Debug)]
 pub struct OutputUserData {
     pub(crate) output: WeakOutput,
+    active: Arc<AtomicBool>,
     last_client_scale: AtomicF64,
     client_scale: Arc<AtomicF64>,
 }
@@ -157,6 +189,7 @@ impl Clone for OutputUserData {
     fn clone(&self) -> Self {
         OutputUserData {
             output: self.output.clone(),
+            active: self.active.clone(),
             last_client_scale: AtomicF64::new(self.last_client_scale.load(Ordering::Acquire)),
             client_scale: self.client_scale.clone(),
         }
@@ -206,14 +239,36 @@ impl Output {
         D: GlobalDispatch<WlOutput, WlOutputData>,
         D: 'static,
     {
+        self.create_global_with_handle::<D>(display).global()
+    }
+
+    /// Create an output registration with a handle that can make late bindings
+    /// inert before the compositor destroys the global.
+    pub fn create_global_with_handle<D>(&self, display: &DisplayHandle) -> OutputGlobal
+    where
+        D: GlobalDispatch<WlOutput, WlOutputData> + 'static,
+    {
         info!(output = self.name(), "Creating new wl_output");
         self.inner.0.lock().unwrap().handle = Some(display.backend_handle().downgrade());
-        display.create_global::<D, WlOutput, _>(4, WlOutputData { output: self.clone() })
+        let output = Arc::new(Mutex::new(Some(self.clone())));
+        let active = Arc::new(AtomicBool::new(true));
+        let id = display.create_global::<D, WlOutput, _>(
+            4,
+            WlOutputData {
+                output: output.clone(),
+                active: active.clone(),
+                identity: self.downgrade(),
+            },
+        );
+        OutputGlobal { id, output, active }
     }
 
     /// Attempt to retrieve a [`Output`] from an existing resource
     pub fn from_resource(output: &WlOutput) -> Option<Output> {
-        output.data::<OutputUserData>().and_then(|ud| ud.output.upgrade())
+        output
+            .data::<OutputUserData>()
+            .filter(|ud| ud.active.load(Ordering::Acquire))
+            .and_then(|ud| ud.output.upgrade())
     }
 
     pub(crate) fn wl_change_current_state(

@@ -35,16 +35,21 @@ where
         data_init: &mut DataInit<'_, D>,
     ) {
         let client_scale = state.client_compositor_state(client).clone_client_scale();
+        let handle = self.output.lock().unwrap().clone();
         let output = data_init.init(
             resource,
             OutputUserData {
-                output: self.output.downgrade(),
+                output: self.identity.clone(),
+                active: self.active.clone(),
                 last_client_scale: AtomicF64::new(client_scale.load(Ordering::Acquire)),
                 client_scale,
             },
         );
 
-        let mut inner = self.output.inner.0.lock().unwrap();
+        let Some(handle) = handle else {
+            return;
+        };
+        let mut inner = handle.inner.0.lock().unwrap();
 
         let span = warn_span!("output_bind", name = inner.name);
         let _enter = span.enter();
@@ -96,7 +101,7 @@ where
         inner.instances.push(output.downgrade());
 
         drop(inner);
-        state.output_bound(self.output.clone(), output);
+        state.output_bound(handle, output);
     }
 }
 
