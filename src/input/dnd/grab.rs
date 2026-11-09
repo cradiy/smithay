@@ -191,6 +191,18 @@ impl<'a, F, D: SeatHandler<PointerFocus = F, TouchFocus = F>> DndTarget<'a, D> {
 
 /// Events that are generated during drag'n'drop
 pub trait DndGrabHandler: SeatHandler + Sized {
+    /// Whether releasing this drag completes a source-side operation even without
+    /// an accepted data offer, for example placing an attached toplevel.
+    ///
+    /// This does not authorize a destination drop or data transfer. The `validated`
+    /// argument of [`Self::dropped`] continues to describe only the data offer.
+    /// An allowed unaccepted drop clears the transfer action, then notifies the
+    /// source that the drop was performed and finished without a data transfer.
+    fn allow_unaccepted_drop(&mut self, seat: &Seat<Self>, location: Point<f64, Logical>) -> bool {
+        let _ = (seat, location);
+        false
+    }
+
     /// The drag'n'drop action was finished by the user releasing the pointer button / touch inputs.
     ///
     /// At this point, any icon should be removed.
@@ -317,10 +329,14 @@ where
             }
         }
 
-        if !validated {
-            self.data_source.cancel();
-        } else {
+        if validated {
             self.data_source.drop_performed();
+        } else if data.allow_unaccepted_drop(&self.seat, self.last_position) {
+            self.data_source.choose_action(super::DndAction::None);
+            self.data_source.drop_performed();
+            self.data_source.finished();
+        } else {
+            self.data_source.cancel();
         }
 
         DndGrabHandler::dropped(

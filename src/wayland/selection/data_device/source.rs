@@ -2,7 +2,7 @@ use std::{
     any::Any,
     cell::RefCell,
     os::fd::{AsFd, OwnedFd},
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 use tracing::debug;
 
@@ -34,6 +34,7 @@ pub struct DataSourceUserData {
     alive_tracker: AliveTracker,
     pub(super) actions_set: std::sync::atomic::AtomicBool,
     display_handle: DisplayHandle,
+    pub(crate) toplevel_drag: Mutex<Option<Arc<Mutex<crate::wayland::xdg_toplevel_drag::DragState>>>>,
 }
 
 impl DataSourceUserData {
@@ -43,6 +44,7 @@ impl DataSourceUserData {
             alive_tracker: Default::default(),
             actions_set: Default::default(),
             display_handle,
+            toplevel_drag: Default::default(),
         }
     }
 }
@@ -92,6 +94,7 @@ where
 
     fn destroyed(&self, state: &mut D, _client: ClientId, source: &WlDataSource) {
         self.alive_tracker.destroy_notify();
+        crate::wayland::xdg_toplevel_drag::source_ended(source);
 
         // Remove the source from the used ones.
         let seat = match state
@@ -157,12 +160,14 @@ impl Source for WlDataSource {
     }
 
     fn drop_performed(&self) {
+        crate::wayland::xdg_toplevel_drag::source_ended(self);
         if self.version() >= wl_data_source::EVT_DND_DROP_PERFORMED_SINCE {
             self.dnd_drop_performed();
         }
     }
 
     fn cancel(&self) {
+        crate::wayland::xdg_toplevel_drag::source_ended(self);
         if self.version() >= 3 {
             self.cancelled();
         }

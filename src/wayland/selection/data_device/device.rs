@@ -141,6 +141,7 @@ where
                         .unwrap()
                         .actions_set
                         .load(std::sync::atomic::Ordering::Relaxed)
+                        || crate::wayland::xdg_toplevel_drag::ToplevelDrag::from_source(source).is_some()
                     {
                         source.post_error(
                             wayland_server::protocol::wl_data_source::Error::InvalidSource,
