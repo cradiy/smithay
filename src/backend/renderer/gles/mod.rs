@@ -240,11 +240,22 @@ impl GlesTargetInternal<'_> {
     }
 
     #[profiling::function]
-    fn make_current(&self, gl: &ffi::Gles2, egl: &EGLContext) -> Result<(), MakeCurrentError> {
+    fn make_current(
+        &self,
+        gl: &ffi::Gles2,
+        egl: &EGLContext,
+        gl_version: GlVersion,
+    ) -> Result<(), MakeCurrentError> {
         unsafe {
             if let GlesTargetInternal::Surface { surface, .. } = self {
                 egl.make_current_with_surface(surface)?;
                 gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+                // A surfaceless binding can leave the default framebuffer with
+                // no color buffers selected, even after its surface is restored.
+                if gl_version >= version::GLES_3_0 {
+                    gl.DrawBuffers(1, &ffi::BACK);
+                    gl.ReadBuffer(ffi::BACK);
+                }
             } else {
                 egl.make_current()?;
                 match self {
@@ -1471,7 +1482,7 @@ impl ExportMem for GlesRenderer {
         region: Rectangle<i32, BufferCoord>,
         fourcc: Fourcc,
     ) -> Result<Self::TextureMapping, Self::Error> {
-        target.0.make_current(&self.gl, &self.egl)?;
+        target.0.make_current(&self.gl, &self.egl, self.gl_version)?;
 
         let (_, has_alpha) = target.0.format().ok_or(GlesError::UnknownPixelFormat)?;
         let (_, format, layout) = fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnknownPixelFormat)?;
@@ -1541,7 +1552,7 @@ impl ExportMem for GlesRenderer {
     ) -> Result<Self::TextureMapping, Self::Error> {
         let mut pbo = 0;
         let target = self.bind_texture(texture)?;
-        target.0.make_current(&self.gl, &self.egl)?;
+        target.0.make_current(&self.gl, &self.egl, self.gl_version)?;
 
         let (_, format, layout) = fourcc_to_gl_formats(fourcc).ok_or(GlesError::UnknownPixelFormat)?;
         let bpp = gl_bpp(format, layout).expect("We check the format before") / 8;
@@ -1875,7 +1886,7 @@ impl<'buffer> BlitFrame<GlesTarget<'buffer>> for GlesFrame<'_, '_> {
         }
         self.target
             .0
-            .make_current(&self.renderer.gl, &self.renderer.egl)?;
+            .make_current(&self.renderer.gl, &self.renderer.egl, self.renderer.gl_version)?;
         res
     }
 
@@ -1889,7 +1900,7 @@ impl<'buffer> BlitFrame<GlesTarget<'buffer>> for GlesFrame<'_, '_> {
         let res = self.renderer.blit(from, self.target, src, dst, filter);
         self.target
             .0
-            .make_current(&self.renderer.gl, &self.renderer.egl)?;
+            .make_current(&self.renderer.gl, &self.renderer.egl, self.renderer.gl_version)?;
         res
     }
 }
@@ -1941,7 +1952,10 @@ impl Blit for GlesRenderer {
             GlesTargetInternal::Renderbuffer { fbo, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, *fbo)
             },
-            _ => {} // Note: The only target missing is `Surface` and handled above
+            GlesTargetInternal::Surface { .. } => unsafe {
+                self.gl.BindFramebuffer(ffi::READ_FRAMEBUFFER, 0);
+                self.gl.ReadBuffer(ffi::BACK);
+            },
         }
         match &dst_target.0 {
             GlesTargetInternal::Image { buf, .. } => unsafe {
@@ -1953,7 +1967,10 @@ impl Blit for GlesRenderer {
             GlesTargetInternal::Renderbuffer { fbo, .. } => unsafe {
                 self.gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, *fbo)
             },
-            _ => {} // Note: The only target missing is `Surface` and handled above
+            GlesTargetInternal::Surface { .. } => unsafe {
+                self.gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, 0);
+                self.gl.DrawBuffers(1, &ffi::BACK);
+            },
         }
 
         let status = unsafe { self.gl.CheckFramebufferStatus(ffi::FRAMEBUFFER) };
@@ -2352,7 +2369,7 @@ impl Renderer for GlesRenderer {
     where
         'buffer: 'frame,
     {
-        target.0.make_current(&self.gl, &self.egl)?;
+        target.0.make_current(&self.gl, &self.egl, self.gl_version)?;
 
         // Collect last frame's timestamps.
         self.profiler.collect(&self.gl);
@@ -3464,7 +3481,11 @@ where
 
 impl Drop for GlesFrameGuard<'_, '_, '_> {
     fn drop(&mut self) {
-        if let Err(err) = self.target.0.make_current(&self.renderer.gl, &self.renderer.egl) {
+        if let Err(err) =
+            self.target
+                .0
+                .make_current(&self.renderer.gl, &self.renderer.egl, self.renderer.gl_version)
+        {
             warn!(?err, "Failed to restore previous render target");
             return;
         }
