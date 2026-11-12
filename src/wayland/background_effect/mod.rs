@@ -30,14 +30,11 @@
 //! ```
 
 use std::sync::{
-    Mutex,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
-use crate::wayland::{
-    GlobalData,
-    compositor::{self, Cacheable},
-};
+use crate::wayland::compositor::{self, Cacheable};
 use wayland_protocols::ext::background_effect::v1::server::ext_background_effect_manager_v1::{
     self, ExtBackgroundEffectManagerV1,
 };
@@ -138,16 +135,42 @@ impl BackgroundEffectSurfaceData {
 #[derive(Debug)]
 pub struct BackgroundEffectState {
     global: GlobalId,
+    managers: Arc<Mutex<Vec<Weak<ExtBackgroundEffectManagerV1>>>>,
+}
+
+/// Shared data for background-effect manager bindings.
+#[derive(Debug, Clone)]
+pub struct BackgroundEffectGlobalData {
+    managers: Arc<Mutex<Vec<Weak<ExtBackgroundEffectManagerV1>>>>,
 }
 
 impl BackgroundEffectState {
-    /// Regiseter new [ExtBackgroundEffectManagerV1] global
+    /// Register a new [ExtBackgroundEffectManagerV1] global
     pub fn new<D>(display: &DisplayHandle) -> BackgroundEffectState
     where
-        D: ExtBackgroundEffectHandler + GlobalDispatch<ExtBackgroundEffectManagerV1, GlobalData>,
+        D: ExtBackgroundEffectHandler
+            + GlobalDispatch<ExtBackgroundEffectManagerV1, BackgroundEffectGlobalData>,
     {
-        let global = display.create_global::<D, ExtBackgroundEffectManagerV1, _>(1, GlobalData);
-        BackgroundEffectState { global }
+        let managers = Arc::new(Mutex::new(Vec::new()));
+        let global = display.create_global::<D, ExtBackgroundEffectManagerV1, _>(
+            1,
+            BackgroundEffectGlobalData {
+                managers: managers.clone(),
+            },
+        );
+        BackgroundEffectState { global, managers }
+    }
+
+    /// Notify existing manager bindings after compositor capabilities change.
+    /// The handler must return the same capabilities for subsequent bindings.
+    pub fn send_capabilities(&self, capabilities: Capability) {
+        self.managers.lock().unwrap().retain(|manager| {
+            let Ok(manager) = manager.upgrade() else {
+                return false;
+            };
+            manager.capabilities(capabilities);
+            true
+        });
     }
 
     /// Returns the [ExtBackgroundEffectManagerV1] global id

@@ -1,4 +1,6 @@
-use crate::wayland::background_effect::{BackgroundEffectSurfaceData, ExtBackgroundEffectHandler};
+use crate::wayland::background_effect::{
+    BackgroundEffectGlobalData, BackgroundEffectSurfaceData, ExtBackgroundEffectHandler,
+};
 use crate::wayland::compositor;
 use crate::wayland::{
     Dispatch2, GlobalData, GlobalDispatch2,
@@ -13,9 +15,10 @@ use wayland_protocols::ext::background_effect::v1::server::{
         Error as SurfaceError, ExtBackgroundEffectSurfaceV1, Request as SurfaceRequest,
     },
 };
-use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, New, Resource};
+use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, New, Resource, Weak};
 
-impl<D: ExtBackgroundEffectHandler> GlobalDispatch2<ExtBackgroundEffectManagerV1, D> for GlobalData
+impl<D: ExtBackgroundEffectHandler> GlobalDispatch2<ExtBackgroundEffectManagerV1, D>
+    for BackgroundEffectGlobalData
 where
     D: Dispatch<ExtBackgroundEffectManagerV1, GlobalData>,
 {
@@ -29,6 +32,9 @@ where
     ) {
         let manager = data_init.init(resource, GlobalData);
         manager.capabilities(state.capabilities());
+        let mut managers = self.managers.lock().unwrap();
+        managers.retain(Weak::is_alive);
+        managers.push(manager.downgrade());
     }
 }
 
