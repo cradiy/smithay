@@ -84,6 +84,11 @@ pub struct ToplevelIconCachedState {
 }
 
 impl ToplevelIconCachedState {
+    /// The immutable icon resource backing this state, including after its client-side destruction.
+    pub fn icon(&self) -> Option<&XdgToplevelIconV1> {
+        self.icon.as_ref()
+    }
+
     fn data(&self) -> Option<&IconData> {
         let icon = self.icon.as_ref()?;
         let data = icon
@@ -355,6 +360,7 @@ impl<D: XdgToplevelIconHandler> Dispatch2<XdgToplevelIconV1, D> for XdgToplevelI
                         "Request made after the icon has been assigned to a toplevel via 'set_icon'"
                             .to_string(),
                     );
+                    return;
                 }
 
                 self.set_icon_name(icon_name);
@@ -366,6 +372,15 @@ impl<D: XdgToplevelIconHandler> Dispatch2<XdgToplevelIconV1, D> for XdgToplevelI
                         "Request made after the icon has been assigned to a toplevel via 'set_icon'"
                             .to_string(),
                     );
+                    return;
+                }
+
+                if scale <= 0 {
+                    icon.post_error(
+                        xdg_toplevel_icon_v1::Error::InvalidBuffer,
+                        "The icon buffer scale must be positive",
+                    );
+                    return;
                 }
 
                 let Some(shm) = buffer.data::<ShmBufferUserData>() else {
