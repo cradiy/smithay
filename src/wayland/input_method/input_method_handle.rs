@@ -118,6 +118,18 @@ impl InputMethodHandle {
         keyboard.grab.is_some()
     }
 
+    /// Send updated keyboard repeat settings to an existing input-method grab.
+    ///
+    /// Call this together with `KeyboardHandle::change_repeat_info`. A newly
+    /// created grab receives the current settings from the seat keyboard.
+    pub fn send_repeat_info(&self, rate: i32, delay: i32) {
+        let inner = self.inner.lock().unwrap();
+        let keyboard = inner.keyboard_grab.inner.lock().unwrap();
+        if let Some(grab) = &keyboard.grab {
+            grab.repeat_info(rate, delay);
+        }
+    }
+
     /// The client of the input method that has grabbed the keyboard, if any.
     ///
     /// This is necessary since input methods like fcitx typically grab the
