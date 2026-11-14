@@ -1,35 +1,48 @@
-// TODO calloop source
-// - poll POLLHUP/POLLIN on close_fd
-// - poll for accept
-
 use calloop::{
     EventSource, Interest, Mode, Poll, PostAction, Readiness, Token, TokenFactory, generic::Generic,
 };
+use rustix::event::{Timespec, epoll};
 use std::{
     io,
-    os::unix::{
-        io::OwnedFd,
-        net::{UnixListener, UnixStream},
+    os::{
+        fd::OwnedFd,
+        unix::net::{UnixListener, UnixStream},
     },
 };
 
 /// Security context listener event source.
 ///
-/// This implements [`EventSource`] and may be inserted into an event loop.
+/// Accepts one connection per readiness event, and retires on close_fd hangup.
 #[derive(Debug)]
 pub struct SecurityContextListenerSource {
-    listen_fd: Generic<UnixListener>,
-    close_fd: Generic<OwnedFd>,
+    listen_fd: UnixListener,
+    _close_fd: OwnedFd,
+    readiness: Generic<OwnedFd>,
 }
 
 impl SecurityContextListenerSource {
     pub(super) fn new(listen_fd: UnixListener, close_fd: OwnedFd) -> io::Result<Self> {
         listen_fd.set_nonblocking(true)?;
-        let listen_fd = Generic::new(listen_fd, Interest::READ, Mode::Level);
-        // close_fd.set_nonblocking(true);
-        // XXX POLLHUP
-        let close_fd = Generic::new(close_fd, Interest::READ, Mode::Level);
-        Ok(Self { listen_fd, close_fd })
+        let poll = epoll::create(epoll::CreateFlags::CLOEXEC)?;
+        epoll::add(
+            &poll,
+            &listen_fd,
+            epoll::EventData::new_u64(0),
+            epoll::EventFlags::IN,
+        )?;
+        // HUP is reported unconditionally. RDHUP also handles a socket peer's
+        // write shutdown, without treating ordinary readable data as closure.
+        epoll::add(
+            &poll,
+            &close_fd,
+            epoll::EventData::new_u64(1),
+            epoll::EventFlags::RDHUP,
+        )?;
+        Ok(Self {
+            listen_fd,
+            _close_fd: close_fd,
+            readiness: Generic::new(poll, Interest::READ, Mode::Level),
+        })
     }
 }
 
@@ -45,37 +58,47 @@ impl EventSource for SecurityContextListenerSource {
         token: Token,
         mut callback: F,
     ) -> io::Result<PostAction> {
-        self.listen_fd.process_events(readiness, token, |_, socket| {
-            loop {
-                match socket.accept() {
+        let listener = &self.listen_fd;
+        self.readiness.process_events(readiness, token, |_, poll| {
+            let mut events = [epoll::Event {
+                flags: epoll::EventFlags::empty(),
+                data: epoll::EventData::new_u64(0),
+            }; 2];
+            let count = match epoll::wait(&**poll, &mut events, Some(&Timespec::default())) {
+                Err(rustix::io::Errno::INTR) => return Ok(PostAction::Continue),
+                result => result?,
+            };
+            let events = &events[..count];
+            // Revoke before accepting, including when both descriptors are ready.
+            if events.iter().any(|event| event.data.u64() == 1) {
+                return Ok(PostAction::Remove);
+            }
+            if events.iter().any(|event| event.data.u64() == 0) {
+                match listener.accept() {
                     Ok((stream, _)) => callback(stream, &mut ()),
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        break;
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::Interrupted
+                                | io::ErrorKind::ConnectionAborted
+                        ) =>
+                    {
+                        ()
                     }
-                    Err(e) => {
-                        return Err(e);
-                    }
+                    Err(error) => return Err(error),
                 }
             }
             Ok(PostAction::Continue)
-        })?;
-
-        self.close_fd
-            .process_events(readiness, token, |_, _fd| Ok(PostAction::Remove))
+        })
     }
-
-    fn register(&mut self, poll: &mut Poll, token_factory: &mut TokenFactory) -> calloop::Result<()> {
-        self.listen_fd.register(poll, token_factory)?;
-        self.close_fd.register(poll, token_factory)
+    fn register(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
+        self.readiness.register(poll, factory)
     }
-
-    fn reregister(&mut self, poll: &mut Poll, token_factory: &mut TokenFactory) -> calloop::Result<()> {
-        self.listen_fd.reregister(poll, token_factory)?;
-        self.close_fd.reregister(poll, token_factory)
+    fn reregister(&mut self, poll: &mut Poll, factory: &mut TokenFactory) -> calloop::Result<()> {
+        self.readiness.reregister(poll, factory)
     }
-
     fn unregister(&mut self, poll: &mut Poll) -> calloop::Result<()> {
-        self.close_fd.unregister(poll)?;
-        self.listen_fd.unregister(poll)
+        self.readiness.unregister(poll)
     }
 }

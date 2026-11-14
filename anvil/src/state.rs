@@ -561,7 +561,12 @@ impl<BackendData: Backend> FractionalScaleHandler for AnvilState<BackendData> {
 }
 
 impl<BackendData: Backend + 'static> SecurityContextHandler for AnvilState<BackendData> {
-    fn context_created(&mut self, source: SecurityContextListenerSource, security_context: SecurityContext) {
+    fn context_created(
+        &mut self,
+        _resource: &smithay::reexports::wayland_protocols::wp::security_context::v1::server::wp_security_context_v1::WpSecurityContextV1,
+        source: SecurityContextListenerSource,
+        security_context: SecurityContext,
+    ) {
         self.handle
             .insert_source(source, move |client_stream, _, data| {
                 let client_state = ClientState {
