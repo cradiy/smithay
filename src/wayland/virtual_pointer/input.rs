@@ -76,6 +76,11 @@ impl std::hash::Hash for VirtualPointerDevice {
 }
 
 impl VirtualPointerDevice {
+    /// The client owning this virtual pointer, while its protocol object is alive.
+    pub fn client(&self) -> Option<wayland_server::Client> {
+        self.pointer.client()
+    }
+
     /// The seat this virtual pointer was created for, if any.
     pub fn wl_seat(&self) -> Option<&WlSeat> {
         self.data.seat.as_ref()
