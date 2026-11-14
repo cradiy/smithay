@@ -59,7 +59,7 @@ mod input;
 use input::{PendingFrame, axis_index};
 pub use input::{
     VirtualPointerAxisEvent, VirtualPointerBackend, VirtualPointerButtonEvent, VirtualPointerDevice,
-    VirtualPointerMotionAbsoluteEvent, VirtualPointerMotionEvent,
+    VirtualPointerMotionAbsoluteEvent, VirtualPointerMotionEvent, VirtualPointerSpecialEvent,
 };
 
 /// Handler for virtual pointer input events.
@@ -356,6 +356,9 @@ where
                         },
                     });
                 }
+                state.process_virtual_pointer_event(InputEvent::Special(VirtualPointerSpecialEvent::Frame {
+                    device: self.device(virtual_pointer),
+                }));
             }
             zwlr_virtual_pointer_v1::Request::Destroy => {
                 // no-op; the device is removed in `destroyed`

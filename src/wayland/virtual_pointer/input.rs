@@ -51,7 +51,17 @@ impl InputBackend for VirtualPointerBackend {
 
     type SwitchToggleEvent = UnusedEvent;
 
-    type SpecialEvent = UnusedEvent;
+    type SpecialEvent = VirtualPointerSpecialEvent;
+}
+
+/// Protocol frame boundaries not represented by ordinary input events.
+#[derive(Debug)]
+pub enum VirtualPointerSpecialEvent {
+    /// End the input sequence from this device, after any buffered scroll events.
+    Frame {
+        /// Device whose input sequence is complete.
+        device: VirtualPointerDevice,
+    },
 }
 
 /// A pointer device created by a `zwlr_virtual_pointer_v1` client.
