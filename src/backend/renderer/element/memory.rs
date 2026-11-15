@@ -476,6 +476,33 @@ pub struct MemoryRenderBufferRenderElement<R: Renderer> {
 }
 
 impl<R: Renderer> MemoryRenderBufferRenderElement<R> {
+    /// The element's output-physical origin before integer rasterization.
+    pub fn location(&self) -> Point<f64, Physical> {
+        self.location
+    }
+
+    /// Snapshot the same image at a different physical origin, retaining its
+    /// texture and damage history. The original scene element is unchanged.
+    pub fn relocated(&self, location: impl Into<Point<f64, Physical>>) -> Self
+    where
+        R::TextureId: Clone,
+    {
+        Self {
+            id: self.id.clone(),
+            location: location.into(),
+            buffer: self.buffer.clone(),
+            alpha: self.alpha,
+            src: self.src,
+            buffer_scale: self.buffer_scale,
+            buffer_transform: self.buffer_transform,
+            size: self.size,
+            damage: self.damage.clone(),
+            opaque_regions: OpaqueRegions::from_slice(&self.opaque_regions),
+            texture: self.texture.clone(),
+            kind: self.kind,
+        }
+    }
+
     /// Create a new [`MemoryRenderBufferRenderElement`] for
     /// a [`MemoryRenderBuffer`]
     pub fn from_buffer(

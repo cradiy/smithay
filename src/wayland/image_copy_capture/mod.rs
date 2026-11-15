@@ -455,7 +455,7 @@ impl CursorSessionRef {
     pub fn update_constraints(&self, constraints: BufferConstraints) {
         let mut inner = self.inner.lock().unwrap();
 
-        if !self.obj.is_alive() || inner.stopped {
+        if inner.stopped {
             return;
         }
 
@@ -512,7 +512,7 @@ impl CursorSessionRef {
 
         let mut inner = self.inner.lock().unwrap();
 
-        if inner.position == position {
+        if inner.stopped || inner.position == position {
             return;
         }
 
@@ -539,7 +539,7 @@ impl CursorSessionRef {
         let hotspot = hotspot.into();
         let mut inner = self.inner.lock().unwrap();
 
-        if inner.hotspot == hotspot {
+        if inner.stopped || inner.hotspot == hotspot {
             return;
         }
 
@@ -793,19 +793,6 @@ pub trait ImageCopyCaptureHandler:
     /// are not granted or the source is invalid).
     fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints>;
 
-    /// Return buffer constraints for capturing the cursor on the given source.
-    ///
-    /// Return `None` if cursor capture is not supported for this source.
-    fn cursor_capture_constraints(
-        &mut self,
-        source: &ImageCaptureSource,
-        pointer: &WlPointer,
-    ) -> Option<BufferConstraints> {
-        let _ = source;
-        let _ = pointer;
-        None
-    }
-
     /// Called when a new capture session is created.
     ///
     /// The compositor should store this session and call
@@ -813,6 +800,10 @@ pub trait ImageCopyCaptureHandler:
     fn new_session(&mut self, session: Session);
 
     /// Called when a new cursor capture session is created.
+    ///
+    /// Retain the owned session and call `update_constraints` when the cursor
+    /// image is available. Constraints may be supplied asynchronously. Dropping
+    /// the session rejects capture and stops its image capture session.
     fn new_cursor_session(&mut self, session: CursorSession) {
         let _ = session;
     }
@@ -1118,16 +1109,11 @@ where
                     user_data,
                 };
 
-                if let Some(constraints) = state.cursor_capture_constraints(&capture_source, &pointer) {
-                    session_ref.update_constraints(constraints);
-                    state
-                        .image_copy_capture_state()
-                        .cursor_sessions
-                        .push(session_ref.clone());
-                    state.new_cursor_session(CursorSession(session_ref));
-                } else {
-                    session_ref.inner.lock().unwrap().stopped = true;
-                }
+                state
+                    .image_copy_capture_state()
+                    .cursor_sessions
+                    .push(session_ref.clone());
+                state.new_cursor_session(CursorSession(session_ref));
             }
             ext_image_copy_capture_manager_v1::Request::Destroy => {}
             _ => unreachable!(),
