@@ -138,6 +138,11 @@ where
                 .client_scale
                 .load(Ordering::Acquire);
             let location = event.location.to_client(client_scale);
+            touch
+                .data::<TouchUserData<D>>()
+                .unwrap()
+                .timestamps
+                .send(event.time);
             touch.down(
                 serial.into(),
                 event.time.millis(),
@@ -153,6 +158,11 @@ where
         let serial = event.serial;
         let slot = event.slot;
         for_each_focused_touch(seat, self, |touch| {
+            touch
+                .data::<TouchUserData<D>>()
+                .unwrap()
+                .timestamps
+                .send(event.time);
             touch.up(serial.into(), event.time.millis(), slot.into());
         });
 
@@ -170,6 +180,11 @@ where
                 .client_scale
                 .load(Ordering::Acquire);
             let location = event.location.to_client(client_scale);
+            touch
+                .data::<TouchUserData<D>>()
+                .unwrap()
+                .timestamps
+                .send(event.time);
             touch.motion(event.time.millis(), slot.into(), location.x, location.y);
         })
     }
@@ -217,6 +232,7 @@ where
 /// User data for touch
 #[derive(Debug)]
 pub struct TouchUserData<D: SeatHandler> {
+    pub(crate) timestamps: crate::wayland::input_timestamps::Timestamps,
     pub(crate) arc: Weak<TouchRc<D>>,
     pub(crate) client_scale: Arc<AtomicF64>,
 }

@@ -282,6 +282,7 @@ where
                 let pointer = data_init.init(
                     id,
                     PointerUserData {
+                        timestamps: Default::default(),
                         arc: ptr_handle
                             .as_ref()
                             .map_or_else(Weak::new, |h| Arc::downgrade(&h.arc)),
@@ -310,6 +311,7 @@ where
                 let keyboard = data_init.init(
                     id,
                     KeyboardUserData {
+                        timestamps: Default::default(),
                         arc: kbd_handle
                             .as_ref()
                             .map_or_else(Weak::new, |h| Arc::downgrade(&h.arc)),
@@ -343,6 +345,7 @@ where
                 let touch = data_init.init(
                     id,
                     TouchUserData {
+                        timestamps: Default::default(),
                         arc: touch_handle
                             .as_ref()
                             .map_or_else(Weak::new, |h| Arc::downgrade(&h.arc)),

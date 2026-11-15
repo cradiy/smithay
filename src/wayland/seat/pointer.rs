@@ -126,12 +126,20 @@ impl WlPointerHandle {
                 .client_scale
                 .load(Ordering::Acquire);
             let location = event.location.to_client(client_scale);
+            ptr.data::<PointerUserData<D>>()
+                .unwrap()
+                .timestamps
+                .send(event.time);
             ptr.motion(event.time.millis(), location.x, location.y);
         })
     }
 
-    fn button(&self, surface: &WlSurface, event: &ButtonEvent) {
+    fn button<D: SeatHandler + 'static>(&self, surface: &WlSurface, event: &ButtonEvent) {
         self.for_each_focused_pointer(surface, |ptr| {
+            ptr.data::<PointerUserData<D>>()
+                .unwrap()
+                .timestamps
+                .send(event.time);
             ptr.button(
                 event.serial.into(),
                 event.time.millis(),
@@ -192,6 +200,10 @@ impl WlPointerHandle {
                 }
                 // stop
                 if details.stop.0 {
+                    ptr.data::<PointerUserData<D>>()
+                        .unwrap()
+                        .timestamps
+                        .send(details.time);
                     ptr.axis_stop(details.time.millis(), WlAxis::HorizontalScroll);
 
                     compositor::with_states(surface, |states| {
@@ -201,6 +213,10 @@ impl WlPointerHandle {
                     });
                 }
                 if details.stop.1 {
+                    ptr.data::<PointerUserData<D>>()
+                        .unwrap()
+                        .timestamps
+                        .send(details.time);
                     ptr.axis_stop(details.time.millis(), WlAxis::VerticalScroll);
 
                     compositor::with_states(surface, |states| {
@@ -223,6 +239,10 @@ impl WlPointerHandle {
                         details.relative_direction.0.into(),
                     );
                 }
+                ptr.data::<PointerUserData<D>>()
+                    .unwrap()
+                    .timestamps
+                    .send(details.time);
                 ptr.axis(
                     details.time.millis(),
                     WlAxis::HorizontalScroll,
@@ -233,6 +253,10 @@ impl WlPointerHandle {
                 if ptr.version() >= 9 {
                     ptr.axis_relative_direction(WlAxis::VerticalScroll, details.relative_direction.1.into());
                 }
+                ptr.data::<PointerUserData<D>>()
+                    .unwrap()
+                    .timestamps
+                    .send(details.time);
                 ptr.axis(
                     details.time.millis(),
                     WlAxis::VerticalScroll,
@@ -319,7 +343,7 @@ where
 
     fn button(&self, seat: &Seat<D>, _data: &mut D, event: &ButtonEvent) {
         if let Some(pointer) = seat.get_pointer() {
-            pointer.arc.wl_pointer.button(self, event);
+            pointer.arc.wl_pointer.button::<D>(self, event);
         }
     }
 
@@ -408,6 +432,7 @@ where
 /// User data for pointer
 #[derive(Debug)]
 pub struct PointerUserData<D: SeatHandler> {
+    pub(crate) timestamps: crate::wayland::input_timestamps::Timestamps,
     pub(crate) arc: std::sync::Weak<PointerRc<D>>,
     pub(crate) client_scale: Arc<AtomicF64>,
 }

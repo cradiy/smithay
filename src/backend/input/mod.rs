@@ -30,7 +30,7 @@ impl InputTime {
     /// is guaranteed by `libinput` and `libei` timestamps, but is not required
     /// by Wayland itself. In practice, this should be true across backends.
     pub fn now() -> Self {
-        Self::from_millis(Clock::<Monotonic>::new().now().as_millis())
+        Self::from_micros(Clock::<Monotonic>::new().now().as_micros())
     }
 
     /// Input time from milliseconds

@@ -108,6 +108,7 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
 
 /// User data for keyboard
 pub struct KeyboardUserData<D: SeatHandler> {
+    pub(crate) timestamps: crate::wayland::input_timestamps::Timestamps,
     pub(crate) arc: Weak<KbdRc<D>>,
 }
 
@@ -303,6 +304,7 @@ impl<D: SeatHandler + 'static> KeyboardTarget<D> for WlSurface {
         time: InputTime,
     ) {
         for_each_focused_kbds(seat, self, |kbd| {
+            kbd.data::<KeyboardUserData<D>>().unwrap().timestamps.send(time);
             kbd.key(
                 serial.into(),
                 time.millis(),
