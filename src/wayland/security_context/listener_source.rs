@@ -82,10 +82,7 @@ impl EventSource for SecurityContextListenerSource {
                             io::ErrorKind::WouldBlock
                                 | io::ErrorKind::Interrupted
                                 | io::ErrorKind::ConnectionAborted
-                        ) =>
-                    {
-                        ()
-                    }
+                        ) => {}
                     Err(error) => return Err(error),
                 }
             }
