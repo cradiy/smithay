@@ -31,6 +31,8 @@ use crate::{
     },
 };
 
+struct TabletCursorOwner<D: TabletSeatHandler>(WeakTabletToolHandle<D>);
+
 impl<D: TabletSeatHandler + 'static> TabletToolHandle<D> {
     fn new_bound<F>(descriptor: TabletToolDescriptor, default_grab: F) -> Self
     where
@@ -442,6 +444,19 @@ where
 
                 let cursor_image = match surface {
                     Some(surface) => {
+                        let owned_by_another_tool = compositor::with_states(&surface, |states| {
+                            states
+                                .data_map
+                                .get::<TabletCursorOwner<D>>()
+                                .is_some_and(|owner| owner.0.upgrade().as_ref() != Some(&handle))
+                        });
+                        if owned_by_another_tool {
+                            tool.post_error(
+                                zwp_tablet_tool_v2::Error::Role,
+                                "Given wl_surface belongs to another tablet tool.",
+                            );
+                            return;
+                        }
                         if compositor::give_role(&surface, CURSOR_IMAGE_ROLE).is_err()
                             && compositor::get_role(&surface) != Some(CURSOR_IMAGE_ROLE)
                         {
@@ -453,6 +468,9 @@ where
                         }
 
                         compositor::with_states(&surface, |states| {
+                            states
+                                .data_map
+                                .insert_if_missing(|| TabletCursorOwner::<D>(handle.downgrade()));
                             states.data_map.insert_if_missing_threadsafe(|| {
                                 Mutex::new(CursorImageAttributes {
                                     hotspot: (0, 0).into(),
