@@ -198,6 +198,7 @@ where
             crate::wayland::xdg_foreign::toplevel_destroyed(state, &surface, &xdg_toplevel.id());
             XdgShellHandler::toplevel_destroyed(state, toplevel);
             compositor::with_states(&surface, |states| {
+                crate::wayland::xdg_toplevel_tag::clear(states);
                 *states
                     .data_map
                     .get::<XdgToplevelSurfaceData>()

@@ -389,6 +389,11 @@ pub struct XdgShellSurfaceUserData {
 }
 
 impl XdgShellSurfaceUserData {
+    /// Associated wl_surface.
+    pub fn wl_surface(&self) -> &wl_surface::WlSurface {
+        &self.wl_surface
+    }
+
     /// Associated xdg_surface
     pub fn xdg_surface(&self) -> &xdg_surface::XdgSurface {
         &self.xdg_surface

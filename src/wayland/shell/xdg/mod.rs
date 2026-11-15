@@ -1675,6 +1675,7 @@ impl ToplevelSurface {
             }
 
             if got_unmapped {
+                crate::wayland::xdg_toplevel_tag::clear(states);
                 trace!(
                     "got unmapped; resetting role and cached state; have {} pending configures",
                     role.pending_configures.len()

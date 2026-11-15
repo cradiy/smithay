@@ -45,8 +45,7 @@ use crate::wayland::{
     Dispatch2, GlobalData, GlobalDispatch2, compositor, shell::xdg::XdgShellSurfaceUserData,
 };
 
-/// Data associated with WlSurface
-/// Represents the client pending state
+/// Metadata belonging to the current xdg_toplevel role on a WlSurface.
 ///
 /// ```no_run
 /// use smithay::wayland::compositor;
@@ -82,6 +81,13 @@ impl XdgToplevelTagSurfaceData {
     /// This description may be shown to the user in UI or read by a screen reader for accessibility purposes.
     pub fn description(&self) -> Option<Arc<str>> {
         self.description.lock().unwrap().clone()
+    }
+}
+
+pub(crate) fn clear(states: &compositor::SurfaceData) {
+    if let Some(data) = states.data_map.get::<XdgToplevelTagSurfaceData>() {
+        *data.tag.lock().unwrap() = None;
+        *data.description.lock().unwrap() = None;
     }
 }
 
@@ -149,6 +155,9 @@ impl<D: XdgToplevelTagHandler> Dispatch2<XdgToplevelTagManagerV1, D> for GlobalD
         match request {
             Request::SetToplevelTag { toplevel, tag } => {
                 let data = toplevel.data::<XdgShellSurfaceUserData>().unwrap();
+                if !data.wl_surface.is_alive() {
+                    return;
+                }
 
                 compositor::with_states(&data.wl_surface, |states| {
                     let data = states
@@ -164,6 +173,9 @@ impl<D: XdgToplevelTagHandler> Dispatch2<XdgToplevelTagManagerV1, D> for GlobalD
                 description,
             } => {
                 let data = toplevel.data::<XdgShellSurfaceUserData>().unwrap();
+                if !data.wl_surface.is_alive() {
+                    return;
+                }
 
                 compositor::with_states(&data.wl_surface, |states| {
                     let data = states
