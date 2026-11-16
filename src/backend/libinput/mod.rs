@@ -609,7 +609,7 @@ impl InputBackend for LibinputInputBackend {
 
     type SwitchToggleEvent = event::switch::SwitchToggleEvent;
 
-    type SpecialEvent = backend::UnusedEvent;
+    type SpecialEvent = event::tablet_pad::TabletPadEvent;
 }
 
 impl From<event::keyboard::KeyState> for backend::KeyState {
@@ -868,6 +868,7 @@ impl EventSource for LibinputInputBackend {
                             trace!("Unknown libinput tablet event");
                         }
                     },
+                    libinput::Event::TabletPad(event) => callback(InputEvent::Special(event), &mut ()),
                     libinput::Event::Switch(switch_event) => match switch_event {
                         event::SwitchEvent::Toggle(event) => {
                             callback(InputEvent::SwitchToggle { event }, &mut ());

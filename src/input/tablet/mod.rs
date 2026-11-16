@@ -324,6 +324,12 @@ pub trait TabletSeatHandler: SeatHandler + Sized {
         let _ = image;
     }
 
+    /// Advisory, focus-authorized action text for a pad button. Presentation is
+    /// compositor policy; no on-screen display is provided by default.
+    fn tablet_pad_feedback(&mut self, pad: &TabletDescriptor, button: u32, description: &str) {
+        let _ = (pad, button, description);
+    }
+
     /// Provides the implicit tool grab for down events
     ///
     /// When the user presses down a tool, an implicit grab is installed. If your
@@ -416,6 +422,8 @@ pub(crate) struct Inner<D: TabletSeatHandler> {
     pub(crate) tablets: HashMap<TabletDescriptor, Tablet>,
     pub(crate) tools: HashMap<TabletToolDescriptor, TabletToolHandle<D>>,
     #[cfg(feature = "wayland_frontend")]
+    pub(crate) pads: HashMap<TabletDescriptor, crate::wayland::tablet_manager::TabletPadHandle>,
+    #[cfg(feature = "wayland_frontend")]
     pub(crate) instances:
         Vec<WlWeak<wayland_protocols::wp::tablet::zv2::server::zwp_tablet_seat_v2::ZwpTabletSeatV2>>,
 }
@@ -446,6 +454,8 @@ impl<D: TabletSeatHandler> Default for Inner<D> {
         Self {
             tablets: HashMap::default(),
             tools: HashMap::default(),
+            #[cfg(feature = "wayland_frontend")]
+            pads: HashMap::default(),
             #[cfg(feature = "wayland_frontend")]
             instances: Vec::default(),
         }

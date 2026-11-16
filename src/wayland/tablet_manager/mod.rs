@@ -96,6 +96,12 @@ use wayland_protocols::wp::tablet::zv2::server::{
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, backend::GlobalId};
 const MANAGER_VERSION: u32 = 1;
 
+mod pad;
+pub use pad::{
+    InvalidTabletPadDescriptor, TabletPadDescriptor, TabletPadGroupDescriptor, TabletPadGroupUserData,
+    TabletPadHandle, TabletPadUserData,
+};
+
 pub(crate) mod tablet;
 mod tablet_seat;
 pub(crate) mod tablet_tool;
@@ -154,6 +160,14 @@ impl<D> Dispatch2<ZwpTabletManagerV2, D> for GlobalData
 where
     D: Dispatch<ZwpTabletSeatV2, TabletSeatUserData<D>>,
     D: Dispatch<ZwpTabletV2, TabletUserData>,
+    D: Dispatch<
+            wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_v2::ZwpTabletPadV2,
+            TabletPadUserData,
+        >,
+    D: Dispatch<
+            wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+            TabletPadGroupUserData,
+        >,
     D: Dispatch<ZwpTabletToolV2, TabletToolUserData<D>>,
     D: SeatHandler + TabletSeatHandler + 'static,
     D: CompositorHandler,

@@ -23,6 +23,14 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
     ) where
         D: Dispatch<ZwpTabletV2, TabletUserData>,
         D: Dispatch<ZwpTabletToolV2, TabletToolUserData<D>>,
+        D: Dispatch<
+                wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_v2::ZwpTabletPadV2,
+                super::TabletPadUserData,
+            >,
+        D: Dispatch<
+                wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_group_v2::ZwpTabletPadGroupV2,
+                super::TabletPadGroupUserData,
+            >,
         D: CompositorHandler,
         <D as TabletSeatHandler>::ToolFocus: WaylandFocus,
         D: 'static,
@@ -40,6 +48,10 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
             tool.arc
                 .wp_tablet_tool
                 .new_instance::<D>(state, client, dh, seat, tool.clone(), desc)
+        }
+
+        for pad in inner.pads.values() {
+            pad.new_instance::<D>(client, dh, seat);
         }
 
         inner.instances.push(seat.downgrade())
