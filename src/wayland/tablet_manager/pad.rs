@@ -2,7 +2,7 @@
 
 mod axis;
 pub use crate::input::tablet::TabletPadControl;
-use axis::{Ring, Strip};
+use axis::{Dial, Ring, Strip};
 pub use axis::{TabletPadAxisSource, TabletPadAxisUserData};
 
 use wayland_server::backend::protocol::ProtocolError;
@@ -39,6 +39,8 @@ pub struct TabletPadGroupDescriptor {
     pub rings: Vec<u32>,
     /// Device-local strip indices belonging to this group.
     pub strips: Vec<u32>,
+    /// Device-local dial indices belonging to this group.
+    pub dials: Vec<u32>,
     /// Number of modes, including the initial mode zero.
     pub modes: u32,
 }
@@ -52,6 +54,8 @@ pub struct TabletPadDescriptor {
     pub rings: u32,
     /// Total number of touch strips.
     pub strips: u32,
+    /// Total number of relative rotary dials.
+    pub dials: u32,
     /// At least one mode group, with disjoint control memberships.
     pub groups: Vec<TabletPadGroupDescriptor>,
 }
@@ -61,7 +65,9 @@ pub struct TabletPadDescriptor {
 pub struct InvalidTabletPadDescriptor;
 impl fmt::Display for InvalidTabletPadDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("pad groups require nonzero modes, disjoint controls, and complete ring/strip membership")
+        f.write_str(
+            "pad groups require nonzero modes, disjoint controls, and complete ring/strip/dial membership",
+        )
     }
 }
 impl std::error::Error for InvalidTabletPadDescriptor {}
@@ -86,6 +92,7 @@ struct Instance {
     groups: Vec<Weak<Group>>,
     rings: Vec<Weak<Ring>>,
     strips: Vec<Weak<Strip>>,
+    dials: Vec<Option<Weak<Dial>>>,
     seat: ObjectId,
     serials: Vec<Option<Serial>>,
     focused: bool,
@@ -115,7 +122,8 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
         D: Dispatch<Pad, TabletPadUserData>
             + Dispatch<Group, TabletPadGroupUserData>
             + Dispatch<Ring, TabletPadAxisUserData>
-            + Dispatch<Strip, TabletPadAxisUserData>,
+            + Dispatch<Strip, TabletPadAxisUserData>
+            + Dispatch<Dial, TabletPadAxisUserData>,
     {
         if descriptor.groups.is_empty() {
             return Err(InvalidTabletPadDescriptor);
@@ -123,6 +131,7 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
         let mut seen = std::collections::HashSet::new();
         let mut rings = std::collections::HashSet::new();
         let mut strips = std::collections::HashSet::new();
+        let mut dials = std::collections::HashSet::new();
         for group in &descriptor.groups {
             if group.modes == 0
                 || group
@@ -137,11 +146,18 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
                     .strips
                     .iter()
                     .any(|strip| *strip >= descriptor.strips || !strips.insert(*strip))
+                || group
+                    .dials
+                    .iter()
+                    .any(|dial| *dial >= descriptor.dials || !dials.insert(*dial))
             {
                 return Err(InvalidTabletPadDescriptor);
             }
         }
-        if rings.len() != descriptor.rings as usize || strips.len() != descriptor.strips as usize {
+        if rings.len() != descriptor.rings as usize
+            || strips.len() != descriptor.strips as usize
+            || dials.len() != descriptor.dials as usize
+        {
             return Err(InvalidTabletPadDescriptor);
         }
         let handle = TabletPadHandle(Arc::new(Mutex::new(PadState {
@@ -181,6 +197,7 @@ impl TabletPadHandle {
             + Dispatch<Group, TabletPadGroupUserData>
             + Dispatch<Ring, TabletPadAxisUserData>
             + Dispatch<Strip, TabletPadAxisUserData>
+            + Dispatch<Dial, TabletPadAxisUserData>
             + 'static,
     {
         let mut state = self.0.lock().unwrap();
@@ -202,6 +219,7 @@ impl TabletPadHandle {
         let mut groups = Vec::new();
         let mut rings = vec![None; state.descriptor.rings as usize];
         let mut strips = vec![None; state.descriptor.strips as usize];
+        let mut dials = vec![None; state.descriptor.dials as usize];
         for group in &state.descriptor.groups {
             let Ok(resource) = client.create_resource::<Group, _, D>(
                 dh,
@@ -254,6 +272,24 @@ impl TabletPadHandle {
                 resource.strip(&strip);
                 strips[*index as usize] = Some(strip.downgrade());
             }
+            if seat.version() >= 2 {
+                for index in &group.dials {
+                    let Ok(dial) = client.create_resource::<Dial, _, D>(
+                        dh,
+                        seat.version(),
+                        TabletPadAxisUserData {
+                            handle: Arc::downgrade(&self.0),
+                            pad: pad.id(),
+                            control: TabletPadControl::Dial(*index),
+                        },
+                    ) else {
+                        no_memory(client, dh);
+                        return;
+                    };
+                    resource.dial(&dial);
+                    dials[*index as usize] = Some(dial.downgrade());
+                }
+            }
             if group.modes > 1 {
                 resource.modes(group.modes);
             }
@@ -269,6 +305,7 @@ impl TabletPadHandle {
             groups,
             rings: rings.into_iter().map(Option::unwrap).collect(),
             strips: strips.into_iter().map(Option::unwrap).collect(),
+            dials,
         };
         if let Some((surface, tablet)) = &state.focus {
             enter(&mut instance, surface, tablet, &state.modes, InputTime::now());

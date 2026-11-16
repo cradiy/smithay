@@ -192,6 +192,7 @@ impl Runtime {
             &TabletDescriptor {
                 name: "Test tablet".into(),
                 usb_id: Some((0x056a, 1)),
+                bus_type: Some(3),
                 syspath: None,
             },
         );

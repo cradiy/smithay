@@ -173,6 +173,8 @@ pub struct TabletDescriptor {
     pub name: String,
     /// Tablet device USB (product,vendor) id
     pub usb_id: Option<(u32, u32)>,
+    /// Linux input bus type, when known.
+    pub bus_type: Option<u32>,
     /// Path to the device
     pub syspath: Option<PathBuf>,
 }
@@ -184,6 +186,7 @@ impl<D: Device> From<&D> for TabletDescriptor {
             name: device.name(),
             syspath: device.syspath(),
             usb_id: device.usb_id(),
+            bus_type: None,
         }
     }
 }
@@ -322,6 +325,8 @@ pub enum TabletPadControl {
     Ring(u32),
     /// A linear touch strip.
     Strip(u32),
+    /// A relative rotary dial.
+    Dial(u32),
 }
 
 /// Handler trait for Tablet Seats

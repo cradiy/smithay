@@ -94,7 +94,7 @@ use wayland_protocols::wp::tablet::zv2::server::{
 };
 
 use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, backend::GlobalId};
-const MANAGER_VERSION: u32 = 1;
+const MANAGER_VERSION: u32 = 2;
 
 mod pad;
 pub use pad::{
@@ -125,6 +125,10 @@ impl TabletManagerState {
         D: Dispatch<ZwpTabletManagerV2, GlobalData>,
         D: Dispatch<ZwpTabletSeatV2, TabletSeatUserData<D>>,
         D: Dispatch<ZwpTabletToolV2, TabletToolUserData<D>>,
+        D: Dispatch<
+                wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+                TabletPadAxisUserData,
+            >,
         D: Dispatch<
                 wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
                 TabletPadAxisUserData,
@@ -178,6 +182,10 @@ where
             TabletPadGroupUserData,
         >,
     D: Dispatch<ZwpTabletToolV2, TabletToolUserData<D>>,
+    D: Dispatch<
+            wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+            TabletPadAxisUserData,
+        >,
     D: Dispatch<
             wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
             TabletPadAxisUserData,

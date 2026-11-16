@@ -24,6 +24,10 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
         D: Dispatch<ZwpTabletV2, TabletUserData>,
         D: Dispatch<ZwpTabletToolV2, TabletToolUserData<D>>,
         D: Dispatch<
+                wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_dial_v2::ZwpTabletPadDialV2,
+                super::TabletPadAxisUserData,
+            >,
+        D: Dispatch<
                 wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
                 super::TabletPadAxisUserData,
             >,

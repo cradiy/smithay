@@ -118,6 +118,17 @@ impl WpTabletHandle {
             wp_tablet.path(syspath.to_owned());
         }
 
+        if wp_tablet.version() >= 2
+            && let Some(bus) = desc.bus_type
+        {
+            wp_tablet
+                .send_event(
+                    wayland_protocols::wp::tablet::zv2::server::zwp_tablet_v2::Event::Bustype {
+                        bustype: wayland_server::WEnum::from(bus),
+                    },
+                )
+                .expect("new tablet resource is live");
+        }
         wp_tablet.done();
 
         self.known_instances.lock().unwrap().push(wp_tablet.downgrade());

@@ -6,7 +6,7 @@ use crate::backend::input::{
 #[cfg(feature = "backend_session")]
 use crate::backend::session::{AsErrno, Session};
 use input as libinput;
-use input::{AsRaw, event};
+use input::{AsRaw, FromRaw, event};
 
 use std::{
     io,
@@ -730,7 +730,29 @@ impl EventSource for LibinputInputBackend {
             let _guard = self.span.enter();
             self.context.dispatch()?;
 
-            for event in &mut self.context {
+            loop {
+                // input 0.10 exposes the typed dial event, but its generic event
+                // decoder does not recognize LIBINPUT_EVENT_TABLET_PAD_DIAL.
+                // Safety: the live context owns this queue; a fetched event is
+                // transferred exactly once into its typed owner, which destroys it.
+                let event = unsafe {
+                    if libinput::ffi::libinput_next_event_type(self.context.as_raw_mut())
+                        == libinput::ffi::libinput_event_type_LIBINPUT_EVENT_TABLET_PAD_DIAL
+                    {
+                        let raw = libinput::ffi::libinput_get_event(self.context.as_raw_mut());
+                        let pad = libinput::ffi::libinput_event_get_tablet_pad_event(raw);
+                        Some(libinput::Event::TabletPad(
+                            event::tablet_pad::TabletPadEvent::Dial(
+                                event::tablet_pad::TabletPadDialEvent::from_raw(pad, &self.context),
+                            ),
+                        ))
+                    } else {
+                        self.context.next()
+                    }
+                };
+                let Some(event) = event else {
+                    break;
+                };
                 match event {
                     libinput::Event::Device(device_event) => match device_event {
                         event::DeviceEvent::Added(device_added_event) => {
@@ -900,4 +922,36 @@ impl EventSource for LibinputInputBackend {
         self.token = None;
         poll.unregister(self.as_fd())
     }
+}
+
+/// Read immutable tablet metadata while the native node is present. Retain this
+/// description for removal instead of querying disappearing sysfs attributes.
+pub fn tablet_descriptor(device: &libinput::Device) -> crate::input::tablet::TabletDescriptor {
+    let descriptor = crate::input::tablet::TabletDescriptor::from(device);
+    #[cfg(feature = "udev")]
+    let descriptor = {
+        let mut descriptor = descriptor;
+        // Safety: this retains the device's own libinput/udev context, without
+        // mixing a separately created udev context into its ancestry.
+        let mut ancestor = unsafe { device.udev_device() };
+        while let Some(current) = ancestor {
+            if let Some(value) = current.attribute_value("id/bustype") {
+                descriptor.bus_type = Some(
+                    u32::from_str_radix(value.to_str().expect("Linux bus type is ASCII").trim(), 16)
+                        .expect("Linux input bus type is hexadecimal"),
+                );
+                break;
+            }
+            ancestor = current.parent();
+        }
+        descriptor
+    };
+    descriptor
+}
+
+/// Query the dial count, unavailable through input 0.10's Device wrapper.
+pub fn tablet_pad_number_of_dials(device: &libinput::Device) -> i32 {
+    // Safety: libinput owns this live device, and the function only reads its
+    // capability data; callers must supply a pad-capable device.
+    unsafe { libinput::ffi::libinput_device_tablet_pad_get_num_dials(device.as_raw_mut()) }
 }
