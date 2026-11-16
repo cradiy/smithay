@@ -1,4 +1,9 @@
-//! Tablet-v2 pad buttons and mode groups.
+//! Tablet-v2 pad controls and mode groups.
+
+mod axis;
+pub use crate::input::tablet::TabletPadControl;
+use axis::{Ring, Strip};
+pub use axis::{TabletPadAxisSource, TabletPadAxisUserData};
 
 use wayland_server::backend::protocol::ProtocolError;
 
@@ -30,25 +35,33 @@ use crate::{
 pub struct TabletPadGroupDescriptor {
     /// Device-local button indices belonging to this group.
     pub buttons: Vec<u32>,
+    /// Device-local ring indices belonging to this group.
+    pub rings: Vec<u32>,
+    /// Device-local strip indices belonging to this group.
+    pub strips: Vec<u32>,
     /// Number of modes, including the initial mode zero.
     pub modes: u32,
 }
 
-/// Implemented pad capabilities. Rings and strips are not exposed by this type.
+/// Implemented indexed controls of one tablet pad.
 #[derive(Debug, Clone)]
 pub struct TabletPadDescriptor {
     /// Total number of indexed buttons.
     pub buttons: u32,
-    /// At least one mode group, with disjoint button memberships.
+    /// Total number of touch rings.
+    pub rings: u32,
+    /// Total number of touch strips.
+    pub strips: u32,
+    /// At least one mode group, with disjoint control memberships.
     pub groups: Vec<TabletPadGroupDescriptor>,
 }
 
-/// A pad description has no groups, zero modes, or invalid button membership.
+/// A pad description has no groups, zero modes, or invalid control membership.
 #[derive(Debug, Clone, Copy)]
 pub struct InvalidTabletPadDescriptor;
 impl fmt::Display for InvalidTabletPadDescriptor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("pad groups must have nonzero modes and disjoint, in-range buttons")
+        f.write_str("pad groups require nonzero modes, disjoint controls, and complete ring/strip membership")
     }
 }
 impl std::error::Error for InvalidTabletPadDescriptor {}
@@ -71,6 +84,8 @@ struct PadState {
 struct Instance {
     pad: Weak<Pad>,
     groups: Vec<Weak<Group>>,
+    rings: Vec<Weak<Ring>>,
+    strips: Vec<Weak<Strip>>,
     seat: ObjectId,
     serials: Vec<Option<Serial>>,
     focused: bool,
@@ -97,21 +112,37 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
         descriptor: TabletPadDescriptor,
     ) -> Result<TabletPadHandle, InvalidTabletPadDescriptor>
     where
-        D: Dispatch<Pad, TabletPadUserData> + Dispatch<Group, TabletPadGroupUserData>,
+        D: Dispatch<Pad, TabletPadUserData>
+            + Dispatch<Group, TabletPadGroupUserData>
+            + Dispatch<Ring, TabletPadAxisUserData>
+            + Dispatch<Strip, TabletPadAxisUserData>,
     {
         if descriptor.groups.is_empty() {
             return Err(InvalidTabletPadDescriptor);
         }
         let mut seen = std::collections::HashSet::new();
+        let mut rings = std::collections::HashSet::new();
+        let mut strips = std::collections::HashSet::new();
         for group in &descriptor.groups {
             if group.modes == 0
                 || group
                     .buttons
                     .iter()
                     .any(|button| *button >= descriptor.buttons || !seen.insert(*button))
+                || group
+                    .rings
+                    .iter()
+                    .any(|ring| *ring >= descriptor.rings || !rings.insert(*ring))
+                || group
+                    .strips
+                    .iter()
+                    .any(|strip| *strip >= descriptor.strips || !strips.insert(*strip))
             {
                 return Err(InvalidTabletPadDescriptor);
             }
+        }
+        if rings.len() != descriptor.rings as usize || strips.len() != descriptor.strips as usize {
+            return Err(InvalidTabletPadDescriptor);
         }
         let handle = TabletPadHandle(Arc::new(Mutex::new(PadState {
             modes: vec![0; descriptor.groups.len()],
@@ -146,7 +177,11 @@ impl<D: TabletSeatHandler + 'static> TabletSeat<D> {
 impl TabletPadHandle {
     pub(super) fn new_instance<D>(&self, client: &Client, dh: &DisplayHandle, seat: &ZwpTabletSeatV2)
     where
-        D: Dispatch<Pad, TabletPadUserData> + Dispatch<Group, TabletPadGroupUserData> + 'static,
+        D: Dispatch<Pad, TabletPadUserData>
+            + Dispatch<Group, TabletPadGroupUserData>
+            + Dispatch<Ring, TabletPadAxisUserData>
+            + Dispatch<Strip, TabletPadAxisUserData>
+            + 'static,
     {
         let mut state = self.0.lock().unwrap();
         let Ok(pad) = client.create_resource::<Pad, _, D>(
@@ -165,6 +200,8 @@ impl TabletPadHandle {
             pad.buttons(state.descriptor.buttons);
         }
         let mut groups = Vec::new();
+        let mut rings = vec![None; state.descriptor.rings as usize];
+        let mut strips = vec![None; state.descriptor.strips as usize];
         for group in &state.descriptor.groups {
             let Ok(resource) = client.create_resource::<Group, _, D>(
                 dh,
@@ -185,6 +222,38 @@ impl TabletPadHandle {
                     .flat_map(|button| button.to_ne_bytes())
                     .collect(),
             );
+            for index in &group.rings {
+                let Ok(ring) = client.create_resource::<Ring, _, D>(
+                    dh,
+                    seat.version(),
+                    TabletPadAxisUserData {
+                        handle: Arc::downgrade(&self.0),
+                        pad: pad.id(),
+                        control: TabletPadControl::Ring(*index),
+                    },
+                ) else {
+                    no_memory(client, dh);
+                    return;
+                };
+                resource.ring(&ring);
+                rings[*index as usize] = Some(ring.downgrade());
+            }
+            for index in &group.strips {
+                let Ok(strip) = client.create_resource::<Strip, _, D>(
+                    dh,
+                    seat.version(),
+                    TabletPadAxisUserData {
+                        handle: Arc::downgrade(&self.0),
+                        pad: pad.id(),
+                        control: TabletPadControl::Strip(*index),
+                    },
+                ) else {
+                    no_memory(client, dh);
+                    return;
+                };
+                resource.strip(&strip);
+                strips[*index as usize] = Some(strip.downgrade());
+            }
             if group.modes > 1 {
                 resource.modes(group.modes);
             }
@@ -198,6 +267,8 @@ impl TabletPadHandle {
             seat: seat.id(),
             serials: vec![None; groups.len()],
             groups,
+            rings: rings.into_iter().map(Option::unwrap).collect(),
+            strips: strips.into_iter().map(Option::unwrap).collect(),
         };
         if let Some((surface, tablet)) = &state.focus {
             enter(&mut instance, surface, tablet, &state.modes, InputTime::now());
@@ -337,40 +408,24 @@ impl<D: TabletSeatHandler + 'static> Dispatch2<Pad, D> for TabletPadUserData {
                 return;
             };
             let identity = {
-                let handle = handle.lock().unwrap();
-                let Some((surface, _)) = &handle.focus else {
-                    return;
-                };
-                if !resource.id().same_client_as(&surface.id()) {
-                    return;
-                }
-                let Some(group) = handle
-                    .descriptor
-                    .groups
-                    .iter()
-                    .position(|group| group.buttons.contains(&button))
+                let Some(identity) =
+                    handle
+                        .lock()
+                        .unwrap()
+                        .feedback(&resource.id(), TabletPadControl::Button(button), serial)
                 else {
                     return;
                 };
-                let valid = handle.instances.iter().any(|instance| {
-                    instance.focused
-                        && instance.pad.id() == resource.id()
-                        && instance.serials[group] == Some(Serial::from(serial))
-                });
-                if !valid {
-                    return;
-                }
-                handle.identity.clone()
+                identity
             };
-            state.tablet_pad_feedback(&identity, button, &description);
+            state.tablet_pad_feedback(&identity, TabletPadControl::Button(button), &description);
         }
     }
 
     fn destroyed(&self, _state: &mut D, _client: ClientId, resource: &Pad) {
         if let Some(handle) = self.0.upgrade() {
             handle.lock().unwrap().instances.retain(|instance| {
-                instance.pad.id() != resource.id()
-                    || instance.groups.iter().any(|group| group.upgrade().is_ok())
+                instance.pad.id() != resource.id() || instance.alive_except(&resource.id())
             });
         }
     }
@@ -390,14 +445,11 @@ impl<D> Dispatch2<Group, D> for TabletPadGroupUserData {
 
     fn destroyed(&self, _state: &mut D, _client: ClientId, resource: &Group) {
         if let Some(handle) = self.handle.upgrade() {
-            handle.lock().unwrap().instances.retain(|instance| {
-                instance.pad.id() != self.pad
-                    || instance.pad.upgrade().is_ok()
-                    || instance
-                        .groups
-                        .iter()
-                        .any(|group| group.id() != resource.id() && group.upgrade().is_ok())
-            });
+            handle
+                .lock()
+                .unwrap()
+                .instances
+                .retain(|instance| instance.pad.id() != self.pad || instance.alive_except(&resource.id()));
         }
     }
 }

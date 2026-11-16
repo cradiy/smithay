@@ -313,6 +313,17 @@ impl<D: SeatHandler + TabletSeatHandler + 'static> TabletSeatTrait<D> for Seat<D
     }
 }
 
+/// A device-local control on a tablet pad.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TabletPadControl {
+    /// An indexed button.
+    Button(u32),
+    /// A circular touch ring.
+    Ring(u32),
+    /// A linear touch strip.
+    Strip(u32),
+}
+
 /// Handler trait for Tablet Seats
 pub trait TabletSeatHandler: SeatHandler + Sized {
     /// Type used to represent the target currently holding the tablet's tool focus
@@ -324,10 +335,10 @@ pub trait TabletSeatHandler: SeatHandler + Sized {
         let _ = image;
     }
 
-    /// Advisory, focus-authorized action text for a pad button. Presentation is
+    /// Advisory, focus-authorized action text for a pad control. Presentation is
     /// compositor policy; no on-screen display is provided by default.
-    fn tablet_pad_feedback(&mut self, pad: &TabletDescriptor, button: u32, description: &str) {
-        let _ = (pad, button, description);
+    fn tablet_pad_feedback(&mut self, pad: &TabletDescriptor, control: TabletPadControl, description: &str) {
+        let _ = (pad, control, description);
     }
 
     /// Provides the implicit tool grab for down events

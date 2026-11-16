@@ -98,8 +98,9 @@ const MANAGER_VERSION: u32 = 1;
 
 mod pad;
 pub use pad::{
-    InvalidTabletPadDescriptor, TabletPadDescriptor, TabletPadGroupDescriptor, TabletPadGroupUserData,
-    TabletPadHandle, TabletPadUserData,
+    InvalidTabletPadDescriptor, TabletPadAxisSource, TabletPadAxisUserData, TabletPadControl,
+    TabletPadDescriptor, TabletPadGroupDescriptor, TabletPadGroupUserData, TabletPadHandle,
+    TabletPadUserData,
 };
 
 pub(crate) mod tablet;
@@ -124,6 +125,14 @@ impl TabletManagerState {
         D: Dispatch<ZwpTabletManagerV2, GlobalData>,
         D: Dispatch<ZwpTabletSeatV2, TabletSeatUserData<D>>,
         D: Dispatch<ZwpTabletToolV2, TabletToolUserData<D>>,
+        D: Dispatch<
+                wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
+                TabletPadAxisUserData,
+            >,
+        D: Dispatch<
+                wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+                TabletPadAxisUserData,
+            >,
         D: TabletSeatHandler,
         D: 'static,
     {
@@ -169,6 +178,14 @@ where
             TabletPadGroupUserData,
         >,
     D: Dispatch<ZwpTabletToolV2, TabletToolUserData<D>>,
+    D: Dispatch<
+            wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_ring_v2::ZwpTabletPadRingV2,
+            TabletPadAxisUserData,
+        >,
+    D: Dispatch<
+            wayland_protocols::wp::tablet::zv2::server::zwp_tablet_pad_strip_v2::ZwpTabletPadStripV2,
+            TabletPadAxisUserData,
+        >,
     D: SeatHandler + TabletSeatHandler + 'static,
     D: CompositorHandler,
     <D as TabletSeatHandler>::ToolFocus: WaylandFocus,
