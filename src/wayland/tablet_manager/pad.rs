@@ -73,6 +73,7 @@ struct Instance {
     groups: Vec<Weak<Group>>,
     seat: ObjectId,
     serials: Vec<Option<Serial>>,
+    focused: bool,
 }
 
 /// User data of a tablet-v2 pad resource.
@@ -193,6 +194,7 @@ impl TabletPadHandle {
         pad.done();
         let mut instance = Instance {
             pad: pad.downgrade(),
+            focused: false,
             seat: seat.id(),
             serials: vec![None; groups.len()],
             groups,
@@ -212,11 +214,12 @@ impl TabletPadHandle {
         }
         if let Some((surface, _)) = state.focus.take() {
             for instance in &mut state.instances {
-                if instance.pad.id().same_client_as(&surface.id()) {
+                if instance.focused {
                     if let Ok(pad) = instance.pad.upgrade() {
                         pad.leave(SERIAL_COUNTER.next_serial().into(), &surface);
                     }
                 }
+                instance.focused = false;
                 instance.serials.fill(None);
             }
         }
@@ -244,9 +247,9 @@ impl TabletPadHandle {
         }
         state.modes[group] = mode;
         let PadState { focus, instances, .. } = &mut *state;
-        if let Some((surface, _)) = focus {
+        if focus.is_some() {
             for instance in instances {
-                if instance.pad.id().same_client_as(&surface.id()) {
+                if instance.focused {
                     send_mode(instance, group, mode, time);
                 }
             }
@@ -257,10 +260,10 @@ impl TabletPadHandle {
     pub fn button(&self, button: u32, pressed: ButtonState, time: InputTime) {
         let state = self.0.lock().unwrap();
         assert!(button < state.descriptor.buttons);
-        if let Some((surface, _)) = &state.focus {
+        if state.focus.is_some() {
             for instance in &state.instances {
-                if let Ok(pad) = instance.pad.upgrade()
-                    && pad.id().same_client_as(&surface.id())
+                if instance.focused
+                    && let Ok(pad) = instance.pad.upgrade()
                 {
                     let pressed = match pressed {
                         ButtonState::Pressed => pad::ButtonState::Pressed,
@@ -284,6 +287,7 @@ fn enter(instance: &mut Instance, surface: &WlSurface, tablet: &Tablet, modes: &
     else {
         return;
     };
+    instance.focused = true;
     if let Ok(pad) = instance.pad.upgrade() {
         pad.enter(SERIAL_COUNTER.next_serial().into(), &tablet, surface);
     }
@@ -349,7 +353,8 @@ impl<D: TabletSeatHandler + 'static> Dispatch2<Pad, D> for TabletPadUserData {
                     return;
                 };
                 let valid = handle.instances.iter().any(|instance| {
-                    instance.pad.id() == resource.id()
+                    instance.focused
+                        && instance.pad.id() == resource.id()
                         && instance.serials[group] == Some(Serial::from(serial))
                 });
                 if !valid {
