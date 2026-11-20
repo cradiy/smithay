@@ -1,5 +1,7 @@
 use wayland_server::protocol::wl_buffer::WlBuffer;
 
+use crate::utils::{Buffer, Rectangle};
+
 use super::{BufferAccessError, BufferData, with_buffer_contents_mut, wl_bytes_per_pixel};
 
 /// Failure to copy a packed image into a client SHM buffer.
@@ -27,10 +29,30 @@ pub fn copy_buffer_contents(
     source: &[u8],
     layout: BufferData,
 ) -> Result<(), BufferCopyError> {
+    copy_buffer_regions(
+        buffer,
+        source,
+        layout,
+        &[Rectangle::from_size((layout.width, layout.height).into())],
+    )
+}
+
+/// Copy regions of an image into the same coordinates in a client SHM buffer.
+///
+/// The layout describes the complete source image. Regions must be nonempty
+/// and lie within that image. Source and destination layouts and all regions
+/// are validated before writing. The buffer's pool offset and row padding are
+/// respected, and pixels outside the regions are preserved.
+pub fn copy_buffer_regions(
+    buffer: &WlBuffer,
+    source: &[u8],
+    layout: BufferData,
+    regions: &[Rectangle<i32, Buffer>],
+) -> Result<(), BufferCopyError> {
     with_buffer_contents_mut(buffer, |ptr, len, destination| {
         // SAFETY: The pool provides writable mapped storage for this closure,
         // protected against concurrent remapping and client-induced SIGBUS.
-        unsafe { copy_rows(ptr, len, destination, source, layout) }
+        unsafe { copy_rows(ptr, len, destination, source, layout, regions) }
     })?
 }
 
@@ -41,6 +63,7 @@ unsafe fn copy_rows(
     target: BufferData,
     source: &[u8],
     layout: BufferData,
+    regions: &[Rectangle<i32, Buffer>],
 ) -> Result<(), BufferCopyError> {
     let invalid = || BufferCopyError::InvalidLayout;
     let bpp = wl_bytes_per_pixel(wayland_server::WEnum::Value(layout.format));
@@ -70,16 +93,31 @@ unsafe fn copy_rows(
     };
     let (input_offset, input_stride) = extent(layout, source.len()).ok_or_else(invalid)?;
     let (output_offset, output_stride) = extent(target, len).ok_or_else(invalid)?;
-    for y in 0..rows {
-        // SAFETY: Both complete image extents were checked above, including
-        // overflow, before the first write. The safe source slice cannot alias
-        // client memory, which the SHM API never exposes as a reference.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                source.as_ptr().add(input_offset + y * input_stride),
-                destination.add(output_offset + y * output_stride),
-                row,
-            );
+    if regions.iter().any(|region| {
+        region.size.w <= 0
+            || region.size.h <= 0
+            || region.loc.x < 0
+            || region.loc.y < 0
+            || region.loc.x > layout.width - region.size.w
+            || region.loc.y > layout.height - region.size.h
+    }) {
+        return Err(invalid());
+    }
+    for region in regions {
+        let x = region.loc.x as usize * bpp as usize;
+        let bytes = region.size.w as usize * bpp as usize;
+        let top = region.loc.y as usize;
+        for y in top..top + region.size.h as usize {
+            // SAFETY: Both complete image extents and all regions were checked
+            // above. The safe source slice cannot alias client memory, which
+            // the SHM API never exposes as a reference.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source.as_ptr().add(input_offset + y * input_stride + x),
+                    destination.add(output_offset + y * output_stride + x),
+                    bytes,
+                );
+            }
         }
     }
     Ok(())
@@ -100,6 +138,10 @@ mod tests {
         }
     }
 
+    fn area(x: i32, y: i32, width: i32, height: i32) -> Rectangle<i32, Buffer> {
+        Rectangle::new((x, y).into(), (width, height).into())
+    }
+
     #[test]
     fn copies_offset_rows_and_preserves_other_pixels_padding_and_pool_neighbors() {
         let mut pool = [0x55; 80];
@@ -112,6 +154,7 @@ mod tests {
                 layout(8, 20, 4, 3),
                 &source,
                 layout(3, 12, 2, 2),
+                &[area(0, 0, 2, 2)],
             )
         }
         .unwrap();
@@ -133,7 +176,16 @@ mod tests {
             pool.with_data_mut(|ptr, len| {
                 // SAFETY: The pool mapping remains valid and protected from SIGBUS
                 // for this closure, including after the client truncates its file.
-                unsafe { copy_rows(ptr, len, layout(8, 4, 1, 1), &[1, 2, 3, 4], layout(0, 4, 1, 1)) }
+                unsafe {
+                    copy_rows(
+                        ptr,
+                        len,
+                        layout(8, 4, 1, 1),
+                        &[1, 2, 3, 4],
+                        layout(0, 4, 1, 1),
+                        &[area(0, 0, 1, 1)],
+                    )
+                }
             })
         };
         write().unwrap().unwrap();
@@ -172,10 +224,32 @@ mod tests {
         ] {
             let mut pool = [0x55; 32];
             // SAFETY: The entire output array remains writable for this call.
-            let result =
-                unsafe { copy_rows(pool.as_mut_ptr(), pool.len(), output, &[0; 32][..bytes], input) };
+            let result = unsafe {
+                copy_rows(
+                    pool.as_mut_ptr(),
+                    pool.len(),
+                    output,
+                    &[0; 32][..bytes],
+                    input,
+                    &[area(0, 0, input.width, input.height)],
+                )
+            };
             assert!(matches!(result, Err(BufferCopyError::InvalidLayout)));
             assert_eq!(pool, [0x55; 32]);
         }
+        let mut pool = [0x55; 32];
+        // SAFETY: The entire output array remains writable for this call.
+        let result = unsafe {
+            copy_rows(
+                pool.as_mut_ptr(),
+                pool.len(),
+                layout(0, 8, 2, 2),
+                &[0; 16],
+                layout(0, 8, 2, 2),
+                &[area(1, 1, 1, 1), area(1, 1, i32::MAX, 1)],
+            )
+        };
+        assert!(matches!(result, Err(BufferCopyError::InvalidLayout)));
+        assert_eq!(pool, [0x55; 32]);
     }
 }
