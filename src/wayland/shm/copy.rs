@@ -1,6 +1,6 @@
 use wayland_server::protocol::wl_buffer::WlBuffer;
 
-use crate::utils::{Buffer, Rectangle};
+use crate::utils::{Buffer, Point, Rectangle};
 
 use super::{BufferAccessError, BufferData, with_buffer_contents_mut, wl_bytes_per_pixel};
 
@@ -33,26 +33,28 @@ pub fn copy_buffer_contents(
         buffer,
         source,
         layout,
+        (0, 0).into(),
         &[Rectangle::from_size((layout.width, layout.height).into())],
     )
 }
 
-/// Copy regions of an image into the same coordinates in a client SHM buffer.
+/// Copy regions of an image into a client SHM buffer at `origin`.
 ///
-/// The layout describes the complete source image. Regions must be nonempty
-/// and lie within that image. Source and destination layouts and all regions
-/// are validated before writing. The buffer's pool offset and row padding are
-/// respected, and pixels outside the regions are preserved.
+/// The layout describes the source image and the regions are relative to its
+/// top-left corner. The entire image must fit at the destination origin. Source
+/// and destination layouts and all nonempty regions are validated before
+/// writing. Pool offsets, padding, and pixels outside the regions are preserved.
 pub fn copy_buffer_regions(
     buffer: &WlBuffer,
     source: &[u8],
     layout: BufferData,
+    origin: Point<i32, Buffer>,
     regions: &[Rectangle<i32, Buffer>],
 ) -> Result<(), BufferCopyError> {
     with_buffer_contents_mut(buffer, |ptr, len, destination| {
         // SAFETY: The pool provides writable mapped storage for this closure,
         // protected against concurrent remapping and client-induced SIGBUS.
-        unsafe { copy_rows(ptr, len, destination, source, layout, regions) }
+        unsafe { copy_rows(ptr, len, destination, source, layout, origin, regions) }
     })?
 }
 
@@ -63,6 +65,7 @@ unsafe fn copy_rows(
     target: BufferData,
     source: &[u8],
     layout: BufferData,
+    origin: Point<i32, Buffer>,
     regions: &[Rectangle<i32, Buffer>],
 ) -> Result<(), BufferCopyError> {
     let invalid = || BufferCopyError::InvalidLayout;
@@ -73,6 +76,10 @@ unsafe fn copy_rows(
         || layout.height <= 0
         || layout.width > target.width
         || layout.height > target.height
+        || origin.x < 0
+        || origin.y < 0
+        || origin.x > target.width - layout.width
+        || origin.y > target.height - layout.height
     {
         return Err(invalid());
     }
@@ -80,19 +87,23 @@ unsafe fn copy_rows(
         .checked_mul(bpp as usize)
         .ok_or_else(invalid)?;
     let rows = layout.height as usize;
-    let extent = |data: BufferData, length: usize| {
+    let extent = |data: BufferData, length: usize, origin: Point<i32, Buffer>| {
         let offset = usize::try_from(data.offset).ok()?;
         let stride = usize::try_from(data.stride).ok()?;
-        if stride < row {
+        let x = (origin.x as usize).checked_mul(bpp as usize)?;
+        if stride < x.checked_add(row)? {
             return None;
         }
-        let end = offset
+        let start = offset
+            .checked_add(stride.checked_mul(origin.y as usize)?)?
+            .checked_add(x)?;
+        let end = start
             .checked_add(stride.checked_mul(rows - 1)?)?
             .checked_add(row)?;
-        (end <= length).then_some((offset, stride))
+        (end <= length).then_some((start, stride))
     };
-    let (input_offset, input_stride) = extent(layout, source.len()).ok_or_else(invalid)?;
-    let (output_offset, output_stride) = extent(target, len).ok_or_else(invalid)?;
+    let (input_offset, input_stride) = extent(layout, source.len(), (0, 0).into()).ok_or_else(invalid)?;
+    let (output_offset, output_stride) = extent(target, len, origin).ok_or_else(invalid)?;
     if regions.iter().any(|region| {
         region.size.w <= 0
             || region.size.h <= 0
@@ -154,13 +165,14 @@ mod tests {
                 layout(8, 20, 4, 3),
                 &source,
                 layout(3, 12, 2, 2),
-                &[area(0, 0, 2, 2)],
+                (1, 1).into(),
+                &[area(0, 0, 1, 2), area(1, 1, 1, 1)],
             )
         }
         .unwrap();
         let mut expected = [0x55; 80];
-        expected[8..16].copy_from_slice(&source[3..11]);
-        expected[28..36].copy_from_slice(&source[15..23]);
+        expected[32..36].copy_from_slice(&source[3..7]);
+        expected[52..60].copy_from_slice(&source[15..23]);
         assert_eq!(pool, expected);
     }
 
@@ -183,6 +195,7 @@ mod tests {
                         layout(8, 4, 1, 1),
                         &[1, 2, 3, 4],
                         layout(0, 4, 1, 1),
+                        (0, 0).into(),
                         &[area(0, 0, 1, 1)],
                     )
                 }
@@ -231,6 +244,7 @@ mod tests {
                     output,
                     &[0; 32][..bytes],
                     input,
+                    (0, 0).into(),
                     &[area(0, 0, input.width, input.height)],
                 )
             };
@@ -246,10 +260,27 @@ mod tests {
                 layout(0, 8, 2, 2),
                 &[0; 16],
                 layout(0, 8, 2, 2),
+                (0, 0).into(),
                 &[area(1, 1, 1, 1), area(1, 1, i32::MAX, 1)],
             )
         };
         assert!(matches!(result, Err(BufferCopyError::InvalidLayout)));
         assert_eq!(pool, [0x55; 32]);
+        for origin in [(-1, 0), (0, i32::MAX), (1, 0)] {
+            // SAFETY: The entire output array remains writable for this call.
+            let result = unsafe {
+                copy_rows(
+                    pool.as_mut_ptr(),
+                    pool.len(),
+                    layout(0, 8, 2, 2),
+                    &[0; 16],
+                    layout(0, 8, 2, 2),
+                    origin.into(),
+                    &[area(0, 0, 1, 1)],
+                )
+            };
+            assert!(matches!(result, Err(BufferCopyError::InvalidLayout)));
+            assert_eq!(pool, [0x55; 32]);
+        }
     }
 }
